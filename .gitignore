@@ -1,0 +1,75 @@
+# ============================================================================
+# Secrets and local config — NEVER COMMIT
+# ============================================================================
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+**/credentials.json
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# ============================================================================
+# Project artifacts (large files, keep on D: but don't commit)
+# ============================================================================
+# Model weights and checkpoints
+models/
+checkpoints/
+
+# HuggingFace cache
+hf_cache/
+
+# CityFlow source/build artifacts (cloned by setup script)
+CityFlow/
+CityFlow/build/
+CityFlow/_skbuild/
+*.so
+
+# Run outputs
+results/
+
+# Cloned third-party repo (clone fresh per environment)
+LLMTSCS/
+
+# Local references and archives
+*.zip
+*.pdf
+
+# ============================================================================
+# IDE / OS
+# ============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================================
+# Notebooks
+# ============================================================================
+*.ipynb_checkpoints/

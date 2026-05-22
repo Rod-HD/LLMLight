@@ -1,0 +1,44 @@
+{
+  "_description": "Cấu hình training pipeline IFT + CGPR cho Qwen2-0.5B (Requirement 6). Trajectory collection (max_requests / min_valid_samples) được áp theo phase đang chạy.",
+
+  "lora": {
+    "rank": 8,
+    "alpha": 16,
+    "target_modules": ["q_proj", "v_proj"],
+    "gradient_accumulation_steps": 4,
+    "batch_size": 1
+  },
+
+  "ift": {
+    "_comment": "Instruction Fine-Tuning trên trajectory data (Requirement 6.1). Checkpoint mỗi epoch boundary, hỗ trợ resume.",
+    "min_epochs": 3,
+    "max_epochs": 10,
+    "checkpoint_dir": "checkpoints/ift"
+  },
+
+  "cgpr": {
+    "_comment": "Critic-Guided Policy Refinement với ranking loss (Requirement 6.2). Phải chạy SAU khi IFT hoàn tất (sequential, không parallel).",
+    "min_epochs": 2,
+    "max_epochs": 5,
+    "checkpoint_dir": "checkpoints/cgpr"
+  },
+
+  "phase1": {
+    "_comment": "Demo mode — vừa quota Puter ≤100 requests/run (Requirement 6.7, 6.8).",
+    "max_requests_phase1": 100,
+    "min_valid_samples_phase1": 50
+  },
+
+  "phase2_phase3": {
+    "_comment": "Full mode — yêu cầu Groq hoặc OpenAI backend. max_requests_full là budget tối đa cho trajectory collection; điều chỉnh theo quota backend (Groq ~14k req/ngày, OpenAI không giới hạn).",
+    "max_requests_full": 5000,
+    "min_valid_samples_full": 200
+  },
+
+  "merged_model_output": {
+    "_comment": "Output của LoRA Merger sau IFT+CGPR (Requirement 6.4, 6.11). Method `lightgpt_mine` load từ đường dẫn này.",
+    "path": "models/qwen2_finetuned"
+  },
+
+  "vram_budget_mb": 7680
+}

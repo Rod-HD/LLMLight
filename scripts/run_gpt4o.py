@@ -1,0 +1,555 @@
+"""scripts/run_gpt4o.py — main runner for LLM remote inference (Task 13.2).
+
+Wires SeedManager → PhaseApprovalGate → PreflightChecker → SimulationConfig
+→ PhaseIndexMapper → CityFlowEngine → ObservationParser →
+:class:`MultiBackendAPIClient` → ResponseParser into a single CLI driver.
+
+Backend is auto-selected from the environment with priority
+``OPENAI > GROQ > PUTER`` (Component 6). The runner labels the produced
+:class:`ExperimentResult.method` accordingly:
+
+* ``OPENAI``  → ``gpt4o_openai``
+* ``GROQ``    → ``gpt4o_groq``
+* ``PUTER``   → ``gpt4o_puter``
+
+Run-counts per phase (Requirement 7 AC 12):
+
+* Phase 1 → 1 run (cost-saving inside Puter free quota).
+* Phase 2 → 3 runs (full mean ± std).
+* Phase 3 → 3 runs (full mean ± std).
+
+``--num-runs`` overrides the default if supplied (use sparingly).
+
+Mode-block (Requirement 7 AC 4): ``--mode full`` + Puter combination is
+rejected at client construction time. Phase 2 / Phase 3 default mode is
+``full``, so Puter is unusable there unless the user explicitly passes
+``--mode demo``.
+
+Per-run, the runner logs total tokens + backend after the run completes
+(Requirement 7 AC 11).
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
+# Ensure src + scripts importable when invoked as ``python scripts/run_gpt4o.py``.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts._runner_utils import (  # noqa: E402
+    DATASET_FILES,
+    VALID_DATASETS,
+    VALID_MODES,
+    VALID_PHASES,
+    VALID_SAVE_REPLAY,
+    build_cityflow_config_path,
+    log_llm_prompt,
+    resolve_mode,
+    resolve_save_replay,
+    setup_basic_logging,
+    utc_iso_timestamp,
+    write_experiment_result,
+)
+from src.metrics_evaluator import MetricsEvaluator  # noqa: E402
+from src.observation_parser import ObservationParser  # noqa: E402
+from src.phase_approval_gate import PhaseApprovalGate  # noqa: E402
+from src.phase_index_mapper import PhaseIndexMapper  # noqa: E402
+from src.preflight_checker import PreflightChecker  # noqa: E402
+from src.response_parser import ResponseParser  # noqa: E402
+from src.seed_manager import SeedManager  # noqa: E402
+from src.sim_config import (  # noqa: E402
+    APIBackend,
+    ExperimentResult,
+    MetricsResult,
+    SimulationConfig,
+    TokenUsageLog,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: Mapping ``APIBackend value → ExperimentResult.method`` (Requirement 7).
+BACKEND_TO_METHOD: dict[str, str] = {
+    "puter": "gpt4o_puter",
+    "groq": "gpt4o_groq",
+    "openai": "gpt4o_openai",
+}
+
+
+def num_runs_for_phase(phase: int) -> int:
+    """Return default ``num_runs`` for the given phase (Requirement 7 AC 12)."""
+    if phase == 1:
+        return 1
+    if phase in (2, 3):
+        return 3
+    raise ValueError(
+        f"num_runs_for_phase: phase must be in {VALID_PHASES}; got {phase!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments.
+
+    ``--num-runs`` defaults to ``None`` so we can apply the phase-aware
+    default (Phase 1 = 1, Phase 2/3 = 3) AFTER the phase is known.
+    """
+    parser = argparse.ArgumentParser(
+        prog="run_gpt4o",
+        description=(
+            "Run GPT-4o (or Llama-3.3 on Groq) over CityFlow simulation. "
+            "Backend auto-selected from env vars with priority "
+            "OPENAI > GROQ > PUTER."
+        ),
+    )
+
+    parser.add_argument(
+        "--dataset",
+        choices=VALID_DATASETS,
+        required=True,
+        help="Dataset id (Phase 1/2: jinan_1/hangzhou_1; Phase 3: newyork_1).",
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=None,
+        help=(
+            "Number of runs. Default: Phase 1 = 1, Phase 2/3 = 3 "
+            "(Requirement 7 AC 12)."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=VALID_MODES,
+        default=None,
+        help=(
+            "Override DEFAULT_RUN_MODE. Phase 1 default 'demo'; "
+            "Phase 2/3 default 'full'."
+        ),
+    )
+    parser.add_argument(
+        "--phase",
+        type=int,
+        choices=VALID_PHASES,
+        default=1,
+        help="Phase to execute (default 1). Phase 3 needs manual approval.",
+    )
+    parser.add_argument(
+        "--save-replay",
+        choices=VALID_SAVE_REPLAY,
+        default="auto",
+        help=(
+            "Replay file policy. 'auto' = on for Phase 1 / off for "
+            "Phase 2-3 unless overridden via .streamlit_pref.json."
+        ),
+    )
+
+    parser.add_argument(
+        "--simulation-config",
+        default="config/simulation.json",
+        help="Path to config/simulation.json.",
+    )
+    parser.add_argument(
+        "--llmtscs-dir",
+        default=None,
+        help="Override LLMTSCS_DIR (defaults to env var).",
+    )
+    parser.add_argument(
+        "--project-dir",
+        default=None,
+        help="Project root for PreflightChecker (default $PROJECT_DIR or CWD).",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to .env file consumed by MultiBackendAPIClient.",
+    )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip PreflightChecker (intended for unit tests / WSL2 reruns).",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.num_runs is not None and args.num_runs <= 0:
+        parser.error("--num-runs must be > 0")
+
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Single simulation
+# ---------------------------------------------------------------------------
+
+
+def run_simulation(
+    *,
+    engine,
+    obs_parser: ObservationParser,
+    response_parser: ResponseParser,
+    phase_mapper: PhaseIndexMapper,
+    api_client,
+    sim_config: SimulationConfig,
+    dataset: str,
+    method: str,
+    run_id: int,
+) -> tuple[MetricsResult, int]:
+    """Drive simulation through ``api_client`` until ``total_timesteps``.
+
+    Mirrors :func:`scripts.run_lightgpt.run_simulation` but calls
+    :meth:`MultiBackendAPIClient.chat_completion` instead of
+    ``LightGPTInference.generate``. Empty content from the API → falls
+    back to ETWT via :class:`ResponseParser`.
+    """
+    intersections = phase_mapper.all_intersections()
+    if not intersections:
+        raise RuntimeError(
+            f"run_simulation: no controllable intersections for {dataset!r}"
+        )
+
+    total_steps = sim_config.total_timesteps
+    decision_cycle_change = (
+        sim_config.green_duration
+        + sim_config.yellow_duration
+        + sim_config.all_red_duration
+    )
+    lane_queues_per_step: list[dict[str, int]] = []
+    elapsed = 0
+    decisions = 0
+    phase_time: dict[str, int] = {i: 0 for i in intersections}
+    current_phase: dict[str, str] = {i: "ETWT" for i in intersections}
+
+    while elapsed < total_steps:
+        for intersection_id in intersections:
+            try:
+                lane_counts = engine.get_lane_vehicle_count()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "run_simulation: get_lane_vehicle_count failed at t=%d "
+                    "intersection=%s: %s; using empty dict.",
+                    elapsed,
+                    intersection_id,
+                    exc,
+                )
+                lane_counts = {}
+
+            state = {
+                "lane_vehicle_count": lane_counts,
+                "current_phase": current_phase[intersection_id],
+                "current_phase_time": phase_time[intersection_id],
+            }
+            prompt = obs_parser.parse(state)
+            api_response = api_client.chat_completion(prompt)
+            raw_response = api_response.content
+            parsed_phase = response_parser.parse(raw_response)
+
+            try:
+                log_llm_prompt(
+                    dataset=dataset,
+                    method=method,
+                    run_id=run_id,
+                    timestep=elapsed,
+                    intersection_id=intersection_id,
+                    prompt=prompt,
+                    raw_response=raw_response,
+                    parsed_phase=parsed_phase,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "run_simulation: failed to log LLM prompt: %s", exc
+                )
+
+            phase_idx = phase_mapper.get_index(intersection_id, parsed_phase)
+            previous = current_phase[intersection_id]
+            engine.set_phase(intersection_id, phase_idx)
+            decisions += 1
+
+            if parsed_phase != previous:
+                current_phase[intersection_id] = parsed_phase
+                phase_time[intersection_id] = sim_config.green_duration
+            else:
+                phase_time[intersection_id] += sim_config.green_duration
+
+        try:
+            lane_queues_per_step.append(dict(engine.get_lane_vehicle_count()))
+        except Exception:  # noqa: BLE001
+            lane_queues_per_step.append({})
+
+        elapsed += decision_cycle_change
+
+    metrics = MetricsEvaluator(total_timesteps=total_steps).evaluate(
+        engine=engine, lane_queues_per_step=lane_queues_per_step
+    )
+    return metrics, decisions
+
+
+# ---------------------------------------------------------------------------
+# Backend label conversion
+# ---------------------------------------------------------------------------
+
+
+def _backend_value(backend: object) -> str:
+    """Coerce a backend marker (Enum or str) to its lowercase string value."""
+    val = getattr(backend, "value", backend)
+    return str(val).lower()
+
+
+def _method_for_backend(backend: object) -> str:
+    val = _backend_value(backend)
+    method = BACKEND_TO_METHOD.get(val)
+    if method is None:
+        raise ValueError(
+            f"_method_for_backend: backend {backend!r} (value={val!r}) is "
+            f"not in {sorted(BACKEND_TO_METHOD.keys())}"
+        )
+    return method
+
+
+def _backend_for_token_usage(backend: object) -> APIBackend:
+    """Cast backend marker to one of the literals accepted by
+    :class:`TokenUsageLog`."""
+    val = _backend_value(backend)
+    if val not in ("puter", "groq", "openai"):
+        raise ValueError(
+            f"_backend_for_token_usage: invalid backend {backend!r}"
+        )
+    # ``APIBackend`` is a Literal alias defined in ``sim_config``; runtime
+    # value is just the string.
+    return val  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# main()
+# ---------------------------------------------------------------------------
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    cityflow_engine_factory=None,
+    api_client_factory=None,
+) -> int:
+    """Entry point. Returns a process exit code (0 = success).
+
+    Args:
+        argv: CLI arguments (default ``sys.argv[1:]``).
+        cityflow_engine_factory: Optional override (tests inject a fake to
+            skip the native cityflow binding). Default lazy-imports
+            :class:`CityFlowEngine`.
+        api_client_factory: Optional override (tests inject a fake to skip
+            HTTP layer). Default lazy-imports
+            :class:`MultiBackendAPIClient`.
+    """
+    setup_basic_logging()
+
+    args = parse_args(argv)
+    mode = resolve_mode(args.mode, args.phase)
+    save_replay = resolve_save_replay(args.save_replay, args.phase)
+
+    # ---- 1) SeedManager (apply ngay) -----------------------------------
+    seed_manager = SeedManager()
+    seed_manager.apply(seed_manager.seed_for_run(0))
+
+    # ---- 2) PhaseApprovalGate ------------------------------------------
+    gate = PhaseApprovalGate()
+    try:
+        gate.validate_phase(args.phase, args.dataset, mode)
+        gate.check_prerequisite(args.phase)
+    except (ValueError, RuntimeError) as exc:
+        logger.error("PhaseApprovalGate rejected request: %s", exc)
+        return 2
+
+    if args.phase == 3:
+        approved = gate.request_manual_approval(
+            phase=3,
+            estimated_cost_usd=None,
+            estimated_time_hours=None,
+        )
+        if not approved:
+            logger.error("Phase 3 manual approval denied; aborting.")
+            return 3
+
+    phase_label = gate.phase_label(args.phase)
+
+    # ---- 3) PreflightChecker (defensive) -------------------------------
+    if not args.skip_preflight:
+        project_dir = (
+            args.project_dir
+            or os.environ.get("PROJECT_DIR")
+            or str(PROJECT_ROOT)
+        )
+        try:
+            PreflightChecker().run_all(project_dir)
+        except (RuntimeError, OSError) as exc:
+            logger.error("PreflightChecker failed: %s", exc)
+            return 4
+
+    # ---- 4) SimulationConfig -------------------------------------------
+    try:
+        sim_config = SimulationConfig.from_json(
+            args.simulation_config, dataset=args.dataset, mode=mode
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("Failed to load simulation config: %s", exc)
+        return 5
+
+    # ---- 5) Resolve LLMTSCS dir ----------------------------------------
+    llmtscs_dir = args.llmtscs_dir or os.environ.get("LLMTSCS_DIR")
+    if not llmtscs_dir:
+        logger.error(
+            "LLMTSCS_DIR not set. Pass --llmtscs-dir or set env var in .env."
+        )
+        return 6
+    if not Path(llmtscs_dir).is_dir():
+        logger.error(
+            "LLMTSCS_DIR %r does not point to an existing directory.",
+            llmtscs_dir,
+        )
+        return 6
+
+    # ---- 6) Build API client (also blocks --mode full + Puter) ---------
+    if api_client_factory is None:
+        from src.training.multi_backend_api_client import (  # noqa: WPS433
+            MultiBackendAPIClient as _MBC,
+        )
+
+        api_client_factory = _MBC
+
+    try:
+        api_client = api_client_factory(env_path=args.env_file, mode=mode)
+    except ValueError as exc:
+        logger.error("Failed to initialise API client: %s", exc)
+        return 8
+
+    method = _method_for_backend(api_client.backend)
+
+    # ---- 7) Resolve num_runs (phase-aware default) ---------------------
+    num_runs = args.num_runs if args.num_runs is not None else num_runs_for_phase(args.phase)
+
+    # ---- 8) Lazy-import CityFlow engine factory ------------------------
+    if cityflow_engine_factory is None:
+        from src.cityflow_engine import CityFlowEngine as _CFE  # noqa: WPS433
+
+        cityflow_engine_factory = _CFE
+
+    obs_parser = ObservationParser()
+    response_parser = ResponseParser()
+
+    # Resolve roadnet path for PhaseIndexMapper.
+    subdir, roadnet_name, _flow = DATASET_FILES[args.dataset]
+    roadnet_path = (
+        Path(llmtscs_dir).resolve() / "data" / subdir / roadnet_name
+    )
+
+    # ---- 9) Run loop ----------------------------------------------------
+    written_paths: list[str] = []
+    for run_id in range(num_runs):
+        seed = seed_manager.seed_for_run(run_id)
+        seed_manager.apply(seed)
+
+        cityflow_config_path = build_cityflow_config_path(
+            args.dataset, llmtscs_dir=llmtscs_dir, seed=seed
+        )
+
+        logger.info(
+            "run_gpt4o: starting method=%s dataset=%s run_id=%d seed=%d "
+            "phase=%s save_replay=%s mode=%s",
+            method,
+            args.dataset,
+            run_id,
+            seed,
+            phase_label,
+            save_replay,
+            mode,
+        )
+
+        phase_mapper = PhaseIndexMapper(str(roadnet_path))
+
+        engine = cityflow_engine_factory(
+            config_path=cityflow_config_path,
+            seed=seed,
+            save_replay=save_replay,
+            dataset=args.dataset,
+            method=method,
+            run_id=run_id,
+            green_duration=sim_config.green_duration,
+            yellow_duration=sim_config.yellow_duration,
+            all_red_duration=sim_config.all_red_duration,
+        )
+
+        start_time = time.time()
+        metrics, decisions = run_simulation(
+            engine=engine,
+            obs_parser=obs_parser,
+            response_parser=response_parser,
+            phase_mapper=phase_mapper,
+            api_client=api_client,
+            sim_config=sim_config,
+            dataset=args.dataset,
+            method=method,
+            run_id=run_id,
+        )
+        duration = time.time() - start_time
+
+        usage = api_client.get_usage_log()
+        total_tokens = usage.total_input_tokens + usage.total_output_tokens
+        logger.info(
+            "run_gpt4o: completed method=%s run_id=%d decisions=%d "
+            "ATT=%.2f AQL=%.2f AWT=%.2f tokens=%d backend=%s duration=%.1fs",
+            method,
+            run_id,
+            decisions,
+            metrics.att,
+            metrics.aql,
+            metrics.awt,
+            total_tokens,
+            _backend_value(api_client.backend),
+            duration,
+        )
+
+        token_usage = TokenUsageLog(
+            backend=_backend_for_token_usage(api_client.backend),
+            total_input_tokens=int(usage.total_input_tokens),
+            total_output_tokens=int(usage.total_output_tokens),
+            total_requests=int(usage.total_requests),
+        )
+        replay_file = getattr(engine, "replay_file", None)
+        result = ExperimentResult(
+            method=method,
+            dataset=args.dataset,
+            run_id=run_id,
+            seed=seed,
+            metrics=metrics,
+            token_usage=token_usage,
+            duration_seconds=duration,
+            timestamp=utc_iso_timestamp(),
+            phase_label=phase_label,
+            replay_file=replay_file,
+        )
+        written_paths.append(write_experiment_result(result))
+
+    logger.info(
+        "run_gpt4o: completed %d run(s); files written to results/metrics/.",
+        len(written_paths),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

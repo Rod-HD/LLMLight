@@ -1,0 +1,38 @@
+{
+  "_description": "Cấu hình simulation thống nhất cho tất cả phương pháp (LLM API, LightGPT local, RL baselines). Mọi runner đọc file này để đảm bảo tham số timing và phase set đồng nhất (Requirement 10).",
+
+  "green_duration": 30,
+  "yellow_duration": 3,
+  "all_red_duration": 2,
+
+  "total_timesteps_demo": 250,
+  "total_timesteps_full": 3600,
+
+  "phase_set": ["ETWT", "NTST", "ELWL", "NLSL"],
+
+  "datasets": {
+    "_comment": "Phase 1 (Demo, 250 timesteps) và Phase 2 (Full, 3600 timesteps) chạy trên hai dataset này. Tên file roadnet/flow trong thư mục data/ của repo LLMTSCS.",
+    "jinan_1": {
+      "roadnet_file": "anon_3_4_jinan_real",
+      "intersections": 12,
+      "grid": "3x4",
+      "phases": ["Phase1", "Phase2"]
+    },
+    "hangzhou_1": {
+      "roadnet_file": "anon_4_4_hangzhou_real",
+      "intersections": 16,
+      "grid": "4x4",
+      "phases": ["Phase1", "Phase2"]
+    }
+  },
+
+  "phase3_datasets": {
+    "_comment": "Phase 3 (Full, 3600 timesteps) chạy riêng trên New York 1 sau khi user xác nhận thủ công bằng cách gõ 'yes' (Requirement 13.4). Phase 1/2 KHÔNG được phép sử dụng dataset này.",
+    "newyork_1": {
+      "roadnet_file": "anon_28_7_newyork_real",
+      "intersections": 196,
+      "grid": "28x7",
+      "phases": ["Phase3"]
+    }
+  }
+}

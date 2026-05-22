@@ -1,0 +1,48 @@
+# LLMLight Reproduction — Python Dependencies (theo Requirement 1.4)
+# Cài vào venv tại /mnt/d/.../LLMLight/venv qua: venv/bin/pip install -r requirements.txt
+
+# ============================================================================
+# Core simulation + ML stack
+# ============================================================================
+# CityFlow được build từ source riêng (Task 1.2), KHÔNG có trên PyPI
+numpy==1.26.2
+pandas==1.5.0
+tensorflow-cpu==2.8.0    # LLMTSCS dependency, không hỗ trợ Python 3.12+
+
+# ============================================================================
+# LLM inference + training
+# ============================================================================
+torch                    # CUDA version, để pip auto-detect CUDA 12 trên RTX 4060
+transformers==4.45.0
+peft==0.7.1
+accelerate==0.27.2
+datasets==2.16.1
+bitsandbytes>=0.43.0,<0.45.0  # 4-bit NF4 quantization, CUDA 12 compat
+sentencepiece            # Tokenizer cho Llama family
+
+# ============================================================================
+# Tooling
+# ============================================================================
+wandb                    # Training run logging
+fire                     # CLI cho training scripts (theo LLMTSCS)
+requests
+python-dotenv
+
+# ============================================================================
+# Testing (Property-Based + Unit + Integration)
+# ============================================================================
+pytest
+pytest-cov
+hypothesis
+responses                # HTTP mock cho MultiBackendAPIClient tests
+
+# ============================================================================
+# Streamlit UI Demo (Task 18, OPTIONAL — chạy local-only)
+# ============================================================================
+streamlit
+altair                   # Chart cho real-time metrics
+
+# ============================================================================
+# OPTIONAL: vllm (chỉ cần khi dùng run_open_LLM_with_vllm.py — KHÔNG cài Phase 1)
+# ============================================================================
+# vllm==0.6.2
