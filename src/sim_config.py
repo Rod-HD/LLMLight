@@ -611,6 +611,8 @@ class ExperimentResult:
     timestamp: str
     phase_label: PhaseLabel
     replay_file: str | None = None
+    api_cache_manifest: str | None = None
+    run_fingerprint: str | None = None
 
     # Dataset hợp lệ — class-level constant, KHÔNG phải dataclass field.
     _VALID_DATASETS: ClassVar[frozenset[str]] = frozenset(
@@ -694,6 +696,24 @@ class ExperimentResult:
             raise ValueError(
                 "ExperimentResult.replay_file must be a non-empty str or None; "
                 f"got {self.replay_file!r}"
+            )
+
+        if self.api_cache_manifest is not None and (
+            not isinstance(self.api_cache_manifest, str)
+            or not self.api_cache_manifest
+        ):
+            raise ValueError(
+                "ExperimentResult.api_cache_manifest must be a non-empty "
+                f"str or None; got {self.api_cache_manifest!r}"
+            )
+
+        if self.run_fingerprint is not None and (
+            not isinstance(self.run_fingerprint, str)
+            or not self.run_fingerprint
+        ):
+            raise ValueError(
+                "ExperimentResult.run_fingerprint must be a non-empty str "
+                f"or None; got {self.run_fingerprint!r}"
             )
 
 

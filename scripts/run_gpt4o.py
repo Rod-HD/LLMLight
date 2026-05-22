@@ -32,6 +32,7 @@ Per-run, the runner logs total tokens + backend after the run completes
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -51,6 +52,7 @@ from scripts._runner_utils import (  # noqa: E402
     VALID_SAVE_REPLAY,
     build_cityflow_config_path,
     log_llm_prompt,
+    experiment_result_filename,
     resolve_mode,
     resolve_save_replay,
     setup_basic_logging,
@@ -70,6 +72,16 @@ from src.sim_config import (  # noqa: E402
     MetricsResult,
     SimulationConfig,
     TokenUsageLog,
+)
+from src.training.api_replay_cache import (  # noqa: E402
+    APIDecisionRecord,
+    APIReplayCache,
+    APIReplayCacheError,
+    stable_hash_json,
+    stable_hash_text,
+)
+from src.training.multi_backend_api_client import (  # noqa: E402
+    TokenUsageLog as APITokenUsageLog,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,6 +196,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip PreflightChecker (intended for unit tests / WSL2 reruns).",
     )
+    parser.add_argument(
+        "--reuse-api-cache",
+        default=None,
+        help=(
+            "Path to an API cache manifest. When set, replay cached "
+            "decisions and do not initialise the API client."
+        ),
+    )
+    parser.add_argument(
+        "--allow-cache-miss-api-call",
+        action="store_true",
+        help=(
+            "Only with --reuse-api-cache: allow fallback API calls on cache "
+            "miss/hash mismatch. Default is to abort before spending quota."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -205,10 +233,18 @@ def run_simulation(
     response_parser: ResponseParser,
     phase_mapper: PhaseIndexMapper,
     api_client,
+    api_cache: APIReplayCache | None = None,
+    run_fingerprint: str | None = None,
     sim_config: SimulationConfig,
     dataset: str,
     method: str,
     run_id: int,
+    phase: int,
+    seed: int = 42,
+    mode: str = "demo",
+    model: str = "",
+    backend: object = "none",
+    allow_cache_miss_api_call: bool = False,
 ) -> tuple[MetricsResult, int]:
     """Drive simulation through ``api_client`` until ``total_timesteps``.
 
@@ -255,9 +291,88 @@ def run_simulation(
                 "current_phase_time": phase_time[intersection_id],
             }
             prompt = obs_parser.parse(state)
-            api_response = api_client.chat_completion(prompt)
-            raw_response = api_response.content
-            parsed_phase = response_parser.parse(raw_response)
+            state_hash = stable_hash_json(state)
+            prompt_hash = stable_hash_text(prompt)
+            started_at = utc_iso_timestamp()
+            input_tokens = 0
+            output_tokens = 0
+            error_type = None
+            fallback_used = False
+
+            if api_client is None:
+                if api_cache is None:
+                    raise RuntimeError(
+                        "run_simulation: api_client is None but no "
+                        "APIReplayCache was provided"
+                    )
+                record = api_cache.get_decision(
+                    elapsed,
+                    intersection_id,
+                    state_hash,
+                    prompt_hash,
+                )
+                raw_response = record.raw_response
+                parsed_phase = record.parsed_phase
+                received_at = record.response_received_at
+                latency_ms = record.latency_ms
+            else:
+                try:
+                    if api_cache is not None:
+                        record = api_cache.get_decision(
+                            elapsed,
+                            intersection_id,
+                            state_hash,
+                            prompt_hash,
+                        )
+                        raw_response = record.raw_response
+                        parsed_phase = record.parsed_phase
+                        received_at = record.response_received_at
+                        latency_ms = record.latency_ms
+                    else:
+                        raise APIReplayCacheError("fresh API run")
+                except APIReplayCacheError:
+                    if api_cache is not None and not allow_cache_miss_api_call:
+                        raise
+                    request_start = time.time()
+                    api_response = api_client.chat_completion(prompt)
+                    latency_ms = int((time.time() - request_start) * 1000)
+                    raw_response = api_response.content
+                    parsed_phase = response_parser.parse(raw_response)
+                    received_at = utc_iso_timestamp()
+                    input_tokens = int(api_response.input_tokens)
+                    output_tokens = int(api_response.output_tokens)
+                    fallback_used = raw_response == ""
+                    if fallback_used:
+                        error_type = "empty_response"
+
+                    if api_cache is not None and run_fingerprint is not None:
+                        api_cache.append(
+                            APIDecisionRecord(
+                                run_fingerprint=run_fingerprint,
+                                dataset=dataset,
+                                phase=phase,
+                                mode=mode,
+                                method=method,
+                                backend=backend,
+                                model=model,
+                                run_id=run_id,
+                                seed=seed,
+                                timestep=elapsed,
+                                intersection_id=intersection_id,
+                                state_hash=state_hash,
+                                prompt_hash=prompt_hash,
+                                prompt=prompt,
+                                raw_response=raw_response,
+                                parsed_phase=parsed_phase,
+                                fallback_used=fallback_used,
+                                error_type=error_type,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                request_started_at=started_at,
+                                response_received_at=received_at,
+                                latency_ms=latency_ms,
+                            )
+                        )
 
             try:
                 log_llm_prompt(
@@ -297,6 +412,42 @@ def run_simulation(
         engine=engine, lane_queues_per_step=lane_queues_per_step
     )
     return metrics, decisions
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_run_fingerprint(
+    *,
+    dataset: str,
+    phase: int,
+    mode: str,
+    method: str,
+    run_id: int,
+    seed: int,
+    roadnet_sha256: str,
+    flow_sha256: str,
+    simulation_config_sha256: str,
+) -> str:
+    """Build a stable run fingerprint for API cache manifests."""
+    return stable_hash_json(
+        {
+            "dataset": dataset,
+            "phase": phase,
+            "mode": mode,
+            "method": method,
+            "run_id": run_id,
+            "seed": seed,
+            "roadnet_sha256": roadnet_sha256,
+            "flow_sha256": flow_sha256,
+            "simulation_config_sha256": simulation_config_sha256,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -423,24 +574,46 @@ def main(
         )
         return 6
 
-    # ---- 6) Build API client (also blocks --mode full + Puter) ---------
-    if api_client_factory is None:
+    # ---- 6) Build API client or load replay cache ----------------------
+    reuse_cache: APIReplayCache | None = None
+    reuse_manifest = None
+    if args.reuse_api_cache:
+        try:
+            reuse_cache = APIReplayCache()
+            reuse_manifest = reuse_cache.load_manifest(args.reuse_api_cache)
+        except (OSError, ValueError, APIReplayCacheError) as exc:
+            logger.error("Failed to load API replay cache: %s", exc)
+            return 8
+
+    if api_client_factory is None and (
+        reuse_manifest is None or args.allow_cache_miss_api_call
+    ):
         from src.training.multi_backend_api_client import (  # noqa: WPS433
             MultiBackendAPIClient as _MBC,
         )
 
         api_client_factory = _MBC
 
-    try:
-        api_client = api_client_factory(env_path=args.env_file, mode=mode)
-    except ValueError as exc:
-        logger.error("Failed to initialise API client: %s", exc)
-        return 8
+    api_client = None
+    if reuse_manifest is None or args.allow_cache_miss_api_call:
+        try:
+            api_client = api_client_factory(env_path=args.env_file, mode=mode)
+        except ValueError as exc:
+            logger.error("Failed to initialise API client: %s", exc)
+            return 8
 
-    method = _method_for_backend(api_client.backend)
+    if reuse_manifest is not None:
+        method = reuse_manifest.method
+        backend = reuse_manifest.backend
+        model = reuse_manifest.model
+    else:
+        method = _method_for_backend(api_client.backend)
+        backend = api_client.backend
+        model = api_client.model
 
     # ---- 7) Resolve num_runs (phase-aware default) ---------------------
     num_runs = args.num_runs if args.num_runs is not None else num_runs_for_phase(args.phase)
+    run_ids = [reuse_manifest.run_id] if reuse_manifest is not None else list(range(num_runs))
 
     # ---- 8) Lazy-import CityFlow engine factory ------------------------
     if cityflow_engine_factory is None:
@@ -452,16 +625,35 @@ def main(
     response_parser = ResponseParser()
 
     # Resolve roadnet path for PhaseIndexMapper.
-    subdir, roadnet_name, _flow = DATASET_FILES[args.dataset]
-    roadnet_path = (
-        Path(llmtscs_dir).resolve() / "data" / subdir / roadnet_name
-    )
+    subdir, roadnet_name, flow_name = DATASET_FILES[args.dataset]
+    data_dir = Path(llmtscs_dir).resolve() / "data" / subdir
+    roadnet_path = data_dir / roadnet_name
+    flow_path = data_dir / flow_name
+    roadnet_sha256 = _sha256_file(roadnet_path)
+    flow_sha256 = _sha256_file(flow_path)
+    simulation_config_sha256 = _sha256_file(Path(args.simulation_config))
 
     # ---- 9) Run loop ----------------------------------------------------
     written_paths: list[str] = []
-    for run_id in range(num_runs):
+    for run_id in run_ids:
         seed = seed_manager.seed_for_run(run_id)
         seed_manager.apply(seed)
+        run_fingerprint = (
+            reuse_manifest.run_fingerprint
+            if reuse_manifest is not None
+            else build_run_fingerprint(
+                dataset=args.dataset,
+                phase=args.phase,
+                mode=mode,
+                method=method,
+                run_id=run_id,
+                seed=seed,
+                roadnet_sha256=roadnet_sha256,
+                flow_sha256=flow_sha256,
+                simulation_config_sha256=simulation_config_sha256,
+            )
+        )
+        run_cache = reuse_cache if reuse_cache is not None else APIReplayCache()
 
         cityflow_config_path = build_cityflow_config_path(
             args.dataset, llmtscs_dir=llmtscs_dir, seed=seed
@@ -504,10 +696,24 @@ def main(
             dataset=args.dataset,
             method=method,
             run_id=run_id,
+            phase=args.phase,
+            seed=seed,
+            mode=mode,
+            model=model,
+            backend=backend,
+            api_cache=run_cache,
+            run_fingerprint=run_fingerprint,
+            allow_cache_miss_api_call=(
+                args.allow_cache_miss_api_call or reuse_manifest is None
+            ),
         )
         duration = time.time() - start_time
 
-        usage = api_client.get_usage_log()
+        usage = (
+            reuse_manifest.token_usage
+            if api_client is None
+            else api_client.get_usage_log()
+        )
         total_tokens = usage.total_input_tokens + usage.total_output_tokens
         logger.info(
             "run_gpt4o: completed method=%s run_id=%d decisions=%d "
@@ -519,12 +725,12 @@ def main(
             metrics.aql,
             metrics.awt,
             total_tokens,
-            _backend_value(api_client.backend),
+            _backend_value(backend),
             duration,
         )
 
         token_usage = TokenUsageLog(
-            backend=_backend_for_token_usage(api_client.backend),
+            backend=_backend_for_token_usage(backend),
             total_input_tokens=int(usage.total_input_tokens),
             total_output_tokens=int(usage.total_output_tokens),
             total_requests=int(usage.total_requests),
@@ -541,7 +747,47 @@ def main(
             timestamp=utc_iso_timestamp(),
             phase_label=phase_label,
             replay_file=replay_file,
+            api_cache_manifest=None,
+            run_fingerprint=run_fingerprint,
         )
+        metrics_file = (
+            Path("results/metrics") / experiment_result_filename(result)
+        )
+        manifest_path = None
+        if reuse_manifest is not None:
+            manifest_path = args.reuse_api_cache
+        else:
+            api_usage = APITokenUsageLog(
+                total_input_tokens=int(usage.total_input_tokens),
+                total_output_tokens=int(usage.total_output_tokens),
+                total_requests=int(usage.total_requests),
+                backend=backend,
+            )
+            manifest = run_cache.build_manifest(
+                dataset=args.dataset,
+                method=method,
+                phase=args.phase,
+                mode=mode,
+                backend=backend,
+                model=model,
+                run_id=run_id,
+                seed=seed,
+                run_fingerprint=run_fingerprint,
+                roadnet_path=str(roadnet_path),
+                roadnet_sha256=roadnet_sha256,
+                flow_path=str(flow_path),
+                flow_sha256=flow_sha256,
+                simulation_config_sha256=simulation_config_sha256,
+                prompt_template_version="observation-parser-v1",
+                code_commit=None,
+                replay_file=replay_file,
+                metrics_file=str(metrics_file),
+                llm_log_dir="results/logs/llm_prompts",
+                token_usage=api_usage,
+            )
+            manifest_path = str(run_cache.write_manifest(manifest))
+
+        result.api_cache_manifest = manifest_path
         written_paths.append(write_experiment_result(result))
 
     logger.info(
