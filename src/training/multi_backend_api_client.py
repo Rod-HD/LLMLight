@@ -23,7 +23,7 @@ Hành vi:
   ``temperature=0``).
 * HTTP 429: chờ 60s rồi retry, tối đa 3 lần; nếu vẫn fail → empty content
   (caller dùng default phase ``ETWT``).
-* Timeout 30s/request → empty content + log warning.
+* Timeout 90s/request → empty content + log warning.
 * HTTP error khác → empty content + log warning + mã HTTP.
 * Puter request limit (100/run) → ``RequestLimitExceeded`` khi vượt.
 
@@ -299,8 +299,8 @@ class MultiBackendAPIClient:
     OPENAI_MODEL = "gpt-4o"
 
     PUTER_MAX_REQUESTS = 100
-    TIMEOUT_SECONDS = 30
-    RETRY_WAIT_SECONDS = 60
+    TIMEOUT_SECONDS = 90  # CodexHub SSE responses can take 60-80s on cold start
+    RETRY_WAIT_SECONDS = 10
     MAX_RETRIES = 3
 
     # Lỗi cấu hình môi trường (Requirement 7.2).
