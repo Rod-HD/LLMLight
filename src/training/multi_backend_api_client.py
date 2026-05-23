@@ -41,6 +41,7 @@ _Requirements_: 7.1-7.12
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -137,6 +138,51 @@ class _HttpTimeout(Exception):
     """
 
 
+def _parse_sse_to_json(text: str) -> dict[str, Any] | None:
+    """Assemble a synthetic non-streaming JSON body from an SSE stream.
+
+    CodexHub always returns SSE regardless of ``stream=false``. This function
+    reconstructs a ``chat.completions`` JSON object so the rest of the client
+    can treat it uniformly.
+    """
+    content_parts: list[str] = []
+    finish_reason: str | None = None
+    meta: dict[str, Any] = {}
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        chunk = line[6:].strip()
+        if chunk == "[DONE]":
+            break
+        try:
+            obj: dict[str, Any] = json.loads(chunk)
+        except Exception:
+            continue
+        if not meta:
+            meta = {k: v for k, v in obj.items() if k != "choices"}
+        choices = obj.get("choices") or []
+        if choices:
+            delta = (choices[0] or {}).get("delta") or {}
+            content_parts.append(delta.get("content") or "")
+            fr = (choices[0] or {}).get("finish_reason")
+            if fr:
+                finish_reason = fr
+    if not meta and not content_parts:
+        return None
+    return {
+        **meta,
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(content_parts)},
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": meta.get("usage") or {},
+    }
+
+
 def _default_http_post(
     url: str,
     *,
@@ -167,7 +213,10 @@ def _default_http_post(
     try:
         body = resp.json()
     except Exception:  # noqa: BLE001 - response may not be JSON
-        body = None
+        # Fallback: parse Server-Sent Events (SSE) stream.
+        # Some proxies (e.g. CodexHub) always return SSE regardless of
+        # the `stream` field in the request body.
+        body = _parse_sse_to_json(resp.text or "")
     return _HttpResponse(
         status_code=resp.status_code,
         json_body=body,
@@ -243,7 +292,7 @@ class MultiBackendAPIClient:
     GROQ_URL = "https://api.groq.com/openai/v1/"
     OPENAI_URL = "https://api.openai.com/v1/"
     CODEXHUB_DEFAULT_URL = "https://api.codexhub.click/v1"
-    CODEXHUB_DEFAULT_MODEL = "cx/gpt-5.4"
+    CODEXHUB_DEFAULT_MODEL = "cx/gpt-5.5"
 
     PUTER_MODEL = "gpt-4o"
     GROQ_MODEL = "llama-3.3-70b-versatile"
