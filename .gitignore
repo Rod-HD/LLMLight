@@ -50,6 +50,7 @@ CityFlow/_skbuild/
 
 # Run outputs
 results/
+records/
 
 # Cloned third-party repo (clone fresh per environment)
 LLMTSCS/

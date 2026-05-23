@@ -44,7 +44,7 @@ VALID_TOTAL_TIMESTEPS: tuple[int, ...] = (250, 3600)
 PhaseLabel = Literal["Phase1", "Phase2", "Phase3"]
 
 #: Backend lựa chọn cho ``MultiBackendAPIClient`` (Requirement 7).
-APIBackend = Literal["puter", "groq", "openai", "none"]
+APIBackend = Literal["puter", "groq", "openai", "codexhub", "none"]
 
 #: Liệt kê các method được ghi vào ``ExperimentResult.method``.
 #: ``lightgpt_hf`` = HuggingFace pre-trained, ``lightgpt_mine`` = self-finetuned
@@ -56,6 +56,7 @@ Method = Literal[
     "gpt4o_puter",
     "gpt4o_groq",
     "gpt4o_openai",
+    "gpt4o_codexhub",
     "maxpressure",
     "advanced_maxpressure",
     "advanced_colight",
@@ -548,10 +549,10 @@ class TokenUsageLog:
     total_requests: int = 0
 
     def __post_init__(self) -> None:
-        if self.backend not in ("puter", "groq", "openai", "none"):
+        if self.backend not in ("puter", "groq", "openai", "codexhub", "none"):
             raise ValueError(
                 "TokenUsageLog.backend must be one of "
-                "{'puter','groq','openai','none'}; "
+                "{'puter','groq','openai','codexhub','none'}; "
                 f"got {self.backend!r}"
             )
         for fname in ("total_input_tokens", "total_output_tokens", "total_requests"):

@@ -96,6 +96,7 @@ BACKEND_TO_METHOD: dict[str, str] = {
     "puter": "gpt4o_puter",
     "groq": "gpt4o_groq",
     "openai": "gpt4o_openai",
+    "codexhub": "gpt4o_codexhub",
 }
 
 
@@ -476,12 +477,10 @@ def _backend_for_token_usage(backend: object) -> APIBackend:
     """Cast backend marker to one of the literals accepted by
     :class:`TokenUsageLog`."""
     val = _backend_value(backend)
-    if val not in ("puter", "groq", "openai"):
+    if val not in ("puter", "groq", "openai", "codexhub"):
         raise ValueError(
             f"_backend_for_token_usage: invalid backend {backend!r}"
         )
-    # ``APIBackend`` is a Literal alias defined in ``sim_config``; runtime
-    # value is just the string.
     return val  # type: ignore[return-value]
 
 

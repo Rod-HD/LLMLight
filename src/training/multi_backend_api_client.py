@@ -1,18 +1,18 @@
 ﻿"""Multi-Backend API Client (Component 6).
 
 Gọi LLM remote qua **một trong bốn backend** với priority
-``CUSTOM > OPENAI > GROQ > PUTER``:
+``CODEXHUB > OPENAI > GROQ > PUTER``:
 
-* ``CUSTOM`` (proxy endpoint hỗ trợ OpenAI-compatible models) —
-  endpoint từ ``CUSTOM_BASE_URL`` env var.
-  Được chọn khi ``CUSTOM_API_KEY`` set; ưu tiên cao nhất.
+* ``CodexHub`` (proxy endpoint hỗ trợ cx/gpt-5.4, cx/gpt-5.5, kr/* models) —
+  endpoint từ ``CODEXHUB_BASE_URL`` env var (mặc định ``https://api.codexhub.click/v1``).
+  Được chọn khi ``CODEXHUB_API_KEY`` set; ưu tiên cao nhất.
 * ``OpenAI`` (paid, ``gpt-4o``) — endpoint ``https://api.openai.com/v1/``.
   Được chọn khi ``OPENAI_API_KEY`` set; không giới hạn requests.
 * ``Groq`` (free, ``llama-3.3-70b-versatile``) — endpoint
   ``https://api.groq.com/openai/v1/``. Được chọn khi ``OPENAI_API_KEY``
   *không* set nhưng ``GROQ_API_KEY`` set; ~14k requests/ngày miễn phí.
 * ``Puter`` (demo, ``gpt-4o``) — endpoint ``https://api.puter.com/puterai/openai/v1/``.
-  Được chọn khi cả ``CUSTOM_API_KEY``, ``OPENAI_API_KEY`` và ``GROQ_API_KEY``
+  Được chọn khi cả ``CODEXHUB_API_KEY``, ``OPENAI_API_KEY`` và ``GROQ_API_KEY``
   *đều không* set, ``PUTER_AUTH_TOKEN`` set; ≤100 requests/run, chỉ ``Demo_mode``.
 
 Hành vi:
@@ -76,7 +76,7 @@ class APIBackend(Enum):
     PUTER = "puter"
     GROQ = "groq"
     OPENAI = "openai"
-    CUSTOM = "custom"
+    CODEXHUB = "codexhub"
 
 
 @dataclass(frozen=True)
@@ -242,8 +242,8 @@ class MultiBackendAPIClient:
     PUTER_URL = "https://api.puter.com/puterai/openai/v1/"
     GROQ_URL = "https://api.groq.com/openai/v1/"
     OPENAI_URL = "https://api.openai.com/v1/"
-    CUSTOM_DEFAULT_URL = "https://api.example.com/v1"
-    CUSTOM_DEFAULT_MODEL = "gpt-4o"
+    CODEXHUB_DEFAULT_URL = "https://api.codexhub.click/v1"
+    CODEXHUB_DEFAULT_MODEL = "cx/gpt-5.4"
 
     PUTER_MODEL = "gpt-4o"
     GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -260,7 +260,7 @@ class MultiBackendAPIClient:
     # Lỗi mode-block với Puter (Requirement 7.4).
     ERR_FULL_MODE_PUTER = (
         "--mode full không tương thích với backend Puter; "
-        "cấu hình CUSTOM_API_KEY, GROQ_API_KEY hoặc OPENAI_API_KEY"
+        "cấu hình CODEXHUB_API_KEY, GROQ_API_KEY hoặc OPENAI_API_KEY"
     )
 
     def __init__(
@@ -297,20 +297,20 @@ class MultiBackendAPIClient:
         self._sleep_fn = sleep_fn if sleep_fn is not None else time.sleep
         self._http_post = http_post if http_post is not None else _default_http_post
 
-        # ---- Backend selection (priority CUSTOM > OPENAI > GROQ > PUTER) -
-        custom_key = (os.environ.get("CUSTOM_API_KEY") or "").strip()
+        # ---- Backend selection (priority CODEXHUB > OPENAI > GROQ > PUTER) -
+        codexhub_key = (os.environ.get("CODEXHUB_API_KEY") or "").strip()
         openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
         groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
         puter_token = (os.environ.get("PUTER_AUTH_TOKEN") or "").strip()
 
-        if custom_key:
-            self._backend = APIBackend.CUSTOM
-            self._api_key = custom_key
+        if codexhub_key:
+            self._backend = APIBackend.CODEXHUB
+            self._api_key = codexhub_key
             self._base_url = (
-                os.environ.get("CUSTOM_BASE_URL") or self.CUSTOM_DEFAULT_URL
+                os.environ.get("CODEXHUB_BASE_URL") or self.CODEXHUB_DEFAULT_URL
             ).strip().rstrip("/")
             self._model = (
-                os.environ.get("CUSTOM_MODEL") or self.CUSTOM_DEFAULT_MODEL
+                os.environ.get("CODEXHUB_MODEL") or self.CODEXHUB_DEFAULT_MODEL
             ).strip()
         elif openai_key:
             self._backend = APIBackend.OPENAI
@@ -373,7 +373,7 @@ class MultiBackendAPIClient:
         if self._backend is APIBackend.PUTER:
             remaining = self.PUTER_MAX_REQUESTS - self._request_count
             return max(0, remaining)
-        return None  # CUSTOM / OPENAI / GROQ: no request limit
+        return None  # CODEXHUB / OPENAI / GROQ: no request limit
 
     def get_usage_log(self) -> TokenUsageLog:
         """Trả về snapshot copy của token usage log."""
@@ -406,7 +406,7 @@ class MultiBackendAPIClient:
             RequestLimitExceeded: Nếu Puter backend đã hit
                 ``PUTER_MAX_REQUESTS`` requests trước khi gọi.
         """
-        # Enforce Puter request limit BEFORE bumping counter (không áp dụng CUSTOM).
+        # Enforce Puter request limit BEFORE bumping counter (không áp dụng CODEXHUB).
         if self._backend is APIBackend.PUTER:
             if self._request_count >= self.PUTER_MAX_REQUESTS:
                 raise RequestLimitExceeded(

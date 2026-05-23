@@ -111,7 +111,7 @@ _CONVERGENCE_PATIENCE: int = 20
 
 #: Default subprocess timeout per run (seconds). Set generous to allow
 #: 100-episode Advanced-CoLight training.
-_DEFAULT_TIMEOUT_SECONDS: int = 7200  # 2h
+_DEFAULT_TIMEOUT_SECONDS: int = 18000  # 5h — advanced_colight 100 rounds ~250 min/run
 
 #: Regex extracting Python dict literal from a single stdout line.
 _RESULTS_LINE_RE = re.compile(
@@ -516,6 +516,11 @@ class RLBaselinesRunner:
             "--traffic_file",
             cli_traffic_file,
         ]
+        # advanced_colight uses multiprocessing.Process by default, which
+        # hides child stdout from subprocess.PIPE. Pass --no_multi_process
+        # so pipeline.py runs in-process and print(last_10_results) is captured.
+        if method == METHOD_ADV_COLIGHT:
+            cmd += ["--no_multi_process"]
         return cmd
 
     def _build_subprocess_env(self, seed: int) -> dict[str, str]:
@@ -524,6 +529,8 @@ class RLBaselinesRunner:
         env["RANDOM_SEED"] = str(int(seed))
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("WANDB_MODE", "offline")
+        # TF 2.8 requires protobuf <= 3.20 or this workaround.
+        env.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
         return env
 
     @staticmethod
