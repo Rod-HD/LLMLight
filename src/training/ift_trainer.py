@@ -164,24 +164,25 @@ class TrainingConfig:
     #: 0.05 là default phổ biến trong PEFT examples).
     lora_dropout: float = 0.05
 
-    #: Gradient accumulation — Requirement 6 AC 3 yêu cầu >= 4.
-    gradient_accumulation_steps: int = 4
+    #: Gradient accumulation — paper effective batch size is 128.
+    gradient_accumulation_steps: int = 128
 
     #: Per-device batch size. Với 8GB VRAM và Qwen2-0.5B, batch_size=1
-    #: là an toàn (effective batch size = 1 * gradient_accumulation = 4).
+    #: là an toàn (effective batch size = 1 * gradient_accumulation = 128).
     batch_size: int = 1
 
-    #: AdamW learning rate. ``2e-4`` là default LoRA fine-tuning rate
-    #: (PEFT documentation).
-    learning_rate: float = 2e-4
+    #: AdamW learning rate from the LLMLight imitation fine-tuning script.
+    learning_rate: float = 3e-4
 
-    #: Max sequence length cho tokenizer truncation. ObservationParser
-    #: tạo prompt ~200-400 tokens; response ~30 tokens; 512 là buffer
-    #: an toàn.
-    max_seq_length: int = 512
+    #: Max sequence length from the LLMLight imitation fine-tuning script.
+    max_seq_length: int = 2048
 
-    #: Số epoch IFT. Requirement 6 AC 1: tối thiểu 3, tối đa 10.
-    ift_epochs: int = 5
+    #: Số epoch IFT. Requirement 6 AC 1: tối thiểu 3, tối đa 30.
+    ift_epochs: int = 30
+
+    #: If True, labels copy input_ids exactly, matching LLMLight paper code.
+    #: If False, prompt tokens are masked with -100 for response-only loss.
+    train_on_inputs: bool = True
 
     #: Thư mục lưu checkpoint mỗi epoch (Requirement 6 AC 6).
     #: Trainer sẽ tạo subdirectories ``checkpoint-<step>`` ở đây.
@@ -342,6 +343,13 @@ class TrainingConfig:
                 f"got {self.learning_rate}"
             )
 
+        # Validate train_on_inputs.
+        if not isinstance(self.train_on_inputs, bool):
+            raise TypeError(
+                "TrainingConfig.train_on_inputs must be bool; "
+                f"got {type(self.train_on_inputs).__name__}"
+            )
+
         # Validate paths.
         for fname in (
             "base_model",
@@ -463,7 +471,7 @@ class IFTTrainer:
     MIN_EPOCHS: Final[int] = 3
 
     #: Max epochs IFT (Requirement 6 AC 1).
-    MAX_EPOCHS: Final[int] = 10
+    MAX_EPOCHS: Final[int] = 30
 
     #: Default device.
     _DEVICE: Final[str] = "cuda:0"
@@ -595,9 +603,13 @@ class IFTTrainer:
             # Qwen2 không có pad_token mặc định; dùng eos_token để pad.
             tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
 
+        # Load base model in fp32 — TrainingArguments(fp16=True) handles the
+        # mixed-precision autocast wrapping at training time. Loading in fp16
+        # here breaks LoRA training because PEFT wraps trainable adapters as
+        # fp16 parameters which the GradScaler then refuses to unscale
+        # ("Attempting to unscale FP16 gradients" — torch/amp/grad_scaler.py).
         base_model = transformers.AutoModelForCausalLM.from_pretrained(
             self.config.base_model,
-            torch_dtype=getattr(torch, "float16", None),
         )
 
         # ----- VRAM check sau model load (Requirement 6 AC 3)
@@ -630,6 +642,8 @@ class IFTTrainer:
             per_device_train_batch_size=self.config.batch_size,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             learning_rate=self.config.learning_rate,
+            warmup_steps=10,
+            group_by_length=True,
             save_strategy="epoch",
             save_total_limit=self.config.save_total_limit,
             logging_steps=self.config.logging_steps,
@@ -638,10 +652,12 @@ class IFTTrainer:
             fp16=True,
         )
 
-        # ----- DataCollator (causal LM, không MLM)
-        data_collator = transformers.DataCollatorForLanguageModeling(
+        # ----- DataCollator (keeps explicit labels and pads dynamically)
+        data_collator = transformers.DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
-            mlm=False,
+            model=model,
+            padding=True,
+            return_tensors="pt",
         )
 
         # ----- Trainer
@@ -725,10 +741,10 @@ class IFTTrainer:
         """Build :class:`datasets.Dataset` từ ``(prompt, response)`` pairs.
 
         Mỗi sample được tokenize thành chuỗi liên tục
-        ``prompt + response + eos`` với ``input_ids`` và ``labels`` —
-        ``labels`` mask prompt tokens với :attr:`_LABEL_IGNORE_INDEX`
-        (``-100``) để loss chỉ tính trên response (instruction-tuning
-        convention).
+        ``prompt + response + eos`` với ``input_ids`` và ``labels``.
+        Mặc định ``labels`` copy toàn bộ ``input_ids`` theo LLMLight paper
+        (``train_on_inputs=True``). Có thể bật legacy response-only loss bằng
+        ``train_on_inputs=False``.
 
         Args:
             data: List of ``(prompt, response)``.
@@ -742,37 +758,47 @@ class IFTTrainer:
         max_len = self.config.max_seq_length
         ignore = self._LABEL_IGNORE_INDEX
         eos_id = getattr(tokenizer, "eos_token_id", None)
+        train_on_inputs = self.config.train_on_inputs
 
         records: list[dict[str, list[int]]] = []
         for prompt, response in data:
-            # Tokenize prompt và response riêng để biết exact prompt length
-            # (cần để mask labels).
-            prompt_ids = tokenizer(
-                prompt,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=max_len,
-            )["input_ids"]
-            response_ids = tokenizer(
-                response,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=max_len,
-            )["input_ids"]
-
-            # Append EOS (nếu có) sau response để model học khi nào dừng.
+            response_ids = list(
+                tokenizer(response, add_special_tokens=False)["input_ids"]
+            )
             if eos_id is not None:
-                response_ids = list(response_ids) + [eos_id]
+                response_ids.append(eos_id)
+            response_ids = response_ids[:max_len]
 
-            input_ids = list(prompt_ids) + list(response_ids)
-            # Truncate combined sequence nếu vượt max_len.
-            if len(input_ids) > max_len:
-                input_ids = input_ids[:max_len]
+            prompt_budget = max(0, max_len - len(response_ids))
+            prompt_ids_full = list(
+                tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            )
+            if len(prompt_ids_full) <= prompt_budget:
+                prompt_ids = prompt_ids_full
+            elif prompt_budget <= 0:
+                prompt_ids = []
+            else:
+                # Project prompts are longer than the paper prompts. Keep
+                # both the beginning and the tail so observation context,
+                # current phase, output instructions, and the final response
+                # all survive inside cutoff_len.
+                head_keep = max(1, int(prompt_budget * 0.3))
+                tail_keep = prompt_budget - head_keep
+                prompt_ids = (
+                    prompt_ids_full[:head_keep]
+                    + prompt_ids_full[-tail_keep:]
+                    if tail_keep > 0
+                    else prompt_ids_full[:head_keep]
+                )
+
+            input_ids = (prompt_ids + response_ids)[:max_len]
             attention_mask = [1] * len(input_ids)
 
-            # Build labels: mask prompt portion với -100.
-            n_prompt = min(len(prompt_ids), len(input_ids))
-            labels = [ignore] * n_prompt + list(input_ids[n_prompt:])
+            if train_on_inputs:
+                labels = list(input_ids)
+            else:
+                n_prompt = min(len(prompt_ids), len(input_ids))
+                labels = [ignore] * n_prompt + list(input_ids[n_prompt:])
 
             records.append(
                 {
@@ -782,6 +808,6 @@ class IFTTrainer:
                 }
             )
 
-        # ``Dataset.from_list`` requires same-shape rows; HuggingFace
-        # ``DataCollatorForLanguageModeling`` will pad dynamically.
+        # ``Dataset.from_list`` accepts ragged rows; the HuggingFace collator
+        # pads dynamically at batch time.
         return datasets_mod.Dataset.from_list(records)

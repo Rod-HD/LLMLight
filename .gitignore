@@ -2,6 +2,7 @@
 # Secrets and local config — NEVER COMMIT
 # ============================================================================
 .env
+.env.*
 .env.local
 .env.*.local
 *.key
@@ -51,6 +52,27 @@ CityFlow/_skbuild/
 # Run outputs
 results/
 records/
+logs/
+
+# Generated datasets (rebuild via scripts/build_ift_dataset.py)
+data/
+
+# Agent/IDE metadata
+.claude/
+.codex/
+.cursor/
+.aider*
+
+# Local debug/scratch scripts (not part of pipeline)
+scripts/debug_*.py
+scripts/check_*.sh
+scripts/test_ckey*
+scripts/test_curl_ckey*
+scripts/test_import.py
+scripts/test_numpy_import.py
+scripts/run_direct.sh
+scripts/run_phase2.sh
+scripts/run_phase2_replay_only.sh
 
 # Cloned third-party repo (clone fresh per environment)
 LLMTSCS/

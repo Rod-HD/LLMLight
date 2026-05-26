@@ -42,10 +42,12 @@ logger = logging.getLogger(__name__)
 # =========================================================================
 
 #: Variant literal type — duy nhất hai giá trị hợp lệ (Requirement 5 AC 9).
-Variant = Literal["lightgpt_hf", "lightgpt_mine"]
+Variant = Literal["lightgpt_hf", "lightgpt_mine", "qwen2_0_5b_base"]
 
 #: Variant set hợp lệ — runtime check.
-VALID_VARIANTS: frozenset[str] = frozenset({"lightgpt_hf", "lightgpt_mine"})
+VALID_VARIANTS: frozenset[str] = frozenset(
+    {"lightgpt_hf", "lightgpt_mine", "qwen2_0_5b_base"}
+)
 
 
 # =========================================================================
@@ -123,11 +125,25 @@ class LightGPTInference:
     #: Training Pipeline; relative đến project root).
     SELF_FINETUNED_PATH: str = "models/qwen2_finetuned/"
 
+    #: Unfinetuned 0.5B baseline used to measure fine-tuning lift.
+    BASE_QWEN_MODEL: str = "Qwen/Qwen2-0.5B"
+
+    #: Prompt window used by the self-finetuned model. IFT keeps prompt head
+    #: + tail inside this budget so the output-format tail survives.
+    SELF_FINETUNED_PROMPT_MAX_TOKENS: int = 512
+
     #: VRAM budget cho RTX 4060 8GB (Requirement 11.1: < 7.5GB).
     MAX_VRAM_MB: float = 7680.0
 
     #: Tokens tối đa generate cho mỗi prompt (Requirement 5 AC 3).
     MAX_NEW_TOKENS: int = 256
+
+    #: The self-finetuned Qwen2-0.5B adapter only needs the signal tag.
+    SELF_FINETUNED_MAX_NEW_TOKENS: int = 12
+
+    #: Keep the unfinetuned baseline bounded; invalid/free-form output is
+    #: still measurable through parser fallback and prompt logs.
+    BASE_QWEN_MAX_NEW_TOKENS: int = 32
 
     #: Timeout per generate call, second (Requirement 5 AC 3).
     TIMEOUT_SECONDS: float = 10.0
@@ -220,11 +236,12 @@ class LightGPTInference:
 
         # ----- VRAM check (Requirement 5 AC 6, Requirement 11.1).
         # Dùng tên model phụ thuộc variant cho log message rõ nghĩa.
-        check_name = (
-            f"lightgpt_mine ({self.SELF_FINETUNED_PATH})"
-            if variant == "lightgpt_mine"
-            else f"lightgpt_hf ({self.HF_MODEL_PRIORITY[0]})"
-        )
+        if variant == "lightgpt_mine":
+            check_name = f"lightgpt_mine ({self.SELF_FINETUNED_PATH})"
+        elif variant == "qwen2_0_5b_base":
+            check_name = f"qwen2_0_5b_base ({self.BASE_QWEN_MODEL})"
+        else:
+            check_name = f"lightgpt_hf ({self.HF_MODEL_PRIORITY[0]})"
         if not vram_monitor.check_vram_available(
             required_mb=self.MIN_VRAM_REQUIRED_MB,
             device=device,
@@ -307,8 +324,52 @@ class LightGPTInference:
 
         if self.variant == "lightgpt_mine":
             self._load_self_finetuned(transformers, quant_config)
+        elif self.variant == "qwen2_0_5b_base":
+            self._load_base_qwen(transformers, quant_config)
         else:
             self._load_from_hf_priority(transformers, quant_config)
+
+    def _load_base_qwen(self, transformers, quant_config) -> None:
+        """Load the unfinetuned Qwen2-0.5B baseline."""
+        model_name = self.BASE_QWEN_MODEL
+        logger.info(
+            "LightGPTInference: loading unfinetuned baseline %s",
+            model_name,
+        )
+        try:
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                model_name,
+                cache_dir=self.cache_dir,
+                token=self.hf_token,
+            )
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quant_config,
+                device_map=self.device,
+                cache_dir=self.cache_dir,
+                token=self.hf_token,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "LightGPTInference: failed to load unfinetuned baseline "
+                f"{model_name!r}: {exc}"
+            ) from exc
+
+        usage_mb = self.get_vram_usage_mb_for_module(model)
+        if usage_mb is not None and usage_mb > self.MAX_VRAM_MB:
+            self._free_module(model)
+            raise RuntimeError(
+                f"{model_name} exceeds {self.MAX_VRAM_MB:.0f}MB VRAM budget "
+                f"at 4-bit (used {usage_mb:.2f}MB)"
+            )
+        self.tokenizer = tokenizer
+        self.model = model
+        self.loaded_model_name = model_name
+        logger.info(
+            "LightGPTInference: loaded %s baseline (VRAM=%.2fMB)",
+            model_name,
+            usage_mb if usage_mb is not None else -1.0,
+        )
 
     def _load_self_finetuned(self, transformers, quant_config) -> None:
         """Load model từ :attr:`SELF_FINETUNED_PATH` (variant lightgpt_mine).
@@ -486,38 +547,23 @@ class LightGPTInference:
         torch = _import_torch()
         assert torch is not None  # load_model would have failed otherwise
 
+        if self.variant in {"lightgpt_mine", "qwen2_0_5b_base"}:
+            try:
+                return self._generate_once(prompt, torch)
+            except BaseException as exc:  # noqa: BLE001
+                logger.warning(
+                    "LightGPTInference.generate: %s: %s; returning empty string",
+                    type(exc).__name__,
+                    exc,
+                )
+                return ""
+
         result_holder: dict[str, str] = {}
         error_holder: dict[str, BaseException] = {}
 
         def _run() -> None:
             try:
-                inputs = self.tokenizer(prompt, return_tensors="pt")
-                # Move tensors to same device as model.
-                try:
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                except Exception:
-                    # If device move fails (e.g. mocked tensors), fall back
-                    # to using inputs as-is.
-                    pass
-                with torch.no_grad():
-                    output_ids = self.model.generate(
-                        **inputs,
-                        max_new_tokens=self.MAX_NEW_TOKENS,
-                        do_sample=False,
-                        temperature=0.0,
-                        pad_token_id=getattr(
-                            self.tokenizer,
-                            "eos_token_id",
-                            None,
-                        ),
-                    )
-                # Strip prompt tokens from output (causal LM convention).
-                input_len = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
-                generated_ids = output_ids[0][input_len:]
-                text = self.tokenizer.decode(
-                    generated_ids, skip_special_tokens=True
-                )
-                result_holder["text"] = text
+                result_holder["text"] = self._generate_once(prompt, torch)
             except BaseException as exc:  # noqa: BLE001
                 error_holder["err"] = exc
 
@@ -540,6 +586,72 @@ class LightGPTInference:
             )
             return ""
         return result_holder.get("text", "")
+
+    def _generate_once(self, prompt: str, torch: Any) -> str:
+        """Run one local generation call and decode only generated tokens."""
+        inputs = self._tokenize_prompt_for_generation(prompt, torch)
+        # Move tensors to same device as model.
+        try:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        except Exception:
+            # If device move fails (e.g. mocked tensors), fall back to using
+            # inputs as-is.
+            pass
+        with torch.no_grad():
+            max_new_tokens = (
+                self.SELF_FINETUNED_MAX_NEW_TOKENS
+                if self.variant == "lightgpt_mine"
+                else self.BASE_QWEN_MAX_NEW_TOKENS
+                if self.variant == "qwen2_0_5b_base"
+                else self.MAX_NEW_TOKENS
+            )
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=getattr(
+                    self.tokenizer,
+                    "eos_token_id",
+                    None,
+                ),
+            )
+        # Strip prompt tokens from output (causal LM convention).
+        input_len = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
+        generated_ids = output_ids[0][input_len:]
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    def _tokenize_prompt_for_generation(
+        self, prompt: str, torch: Any
+    ) -> dict[str, Any]:
+        """Tokenize prompt with the IFT truncation policy for lightgpt_mine."""
+        if self.variant not in {"lightgpt_mine", "qwen2_0_5b_base"}:
+            return self.tokenizer(prompt, return_tensors="pt")
+
+        try:
+            prompt_ids_full = list(
+                self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            )
+        except TypeError:
+            return self.tokenizer(prompt, return_tensors="pt")
+
+        max_len = self.SELF_FINETUNED_PROMPT_MAX_TOKENS
+        if len(prompt_ids_full) <= max_len:
+            return self.tokenizer(prompt, return_tensors="pt")
+
+        head_keep = max(1, int(max_len * 0.3))
+        tail_keep = max_len - head_keep
+        prompt_ids = prompt_ids_full[:head_keep] + prompt_ids_full[-tail_keep:]
+
+        if not hasattr(torch, "tensor"):
+            return self.tokenizer(prompt, return_tensors="pt")
+
+        kwargs: dict[str, Any] = {}
+        if hasattr(torch, "long"):
+            kwargs["dtype"] = torch.long
+        return {
+            "input_ids": torch.tensor([prompt_ids], **kwargs),
+            "attention_mask": torch.tensor([[1] * len(prompt_ids)], **kwargs),
+        }
 
     # --------------------------------------------------------------- VRAM --
 

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>LLMLight Side-by-side Viewer</title>
+    <link rel="stylesheet" href="css/style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.0/dist/pixi.min.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div class="app-viewport">
+<header class="app-header">
+    <h1>LLMLight — Side-by-side Replay Comparison</h1>
+    <div class="header-controls">
+        <label class="toggle">
+            <input type="checkbox" id="high-contrast" />
+            High-contrast
+        </label>
+        <label class="slider-label">
+            Vehicle scale
+            <input type="range" id="vehicle-scale" min="1" max="5" step="0.5" value="2" />
+            <span id="vehicle-scale-val">2x</span>
+        </label>
+    </div>
+</header>
+
+<main class="panels">
+    <section class="panel" data-panel="A">
+        <div class="panel-head">
+            <h2>Method A</h2>
+            <select class="replay-select" data-panel="A">
+                <option value="">— Select replay —</option>
+            </select>
+            <button class="load-btn" data-panel="A" disabled>Load</button>
+            <span class="status" data-panel="A">idle</span>
+        </div>
+        <div class="canvas-wrap">
+            <canvas class="map-canvas" data-panel="A"></canvas>
+        </div>
+        <div class="metrics-box" data-panel="A">
+            <div class="metric-group">
+                <h3>Live (this step)</h3>
+                <table class="metrics-live">
+                    <tbody>
+                        <tr><th>AWT (s)</th><td data-metric="awt">—</td></tr>
+                        <tr><th>AQL (veh/lane)</th><td data-metric="aql">—</td></tr>
+                        <tr><th>Throughput</th><td data-metric="throughput">—</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="metric-group">
+                <h3 title="Final metrics computed by the runner from CityFlow engine output">Ground-truth (final)</h3>
+                <table class="metrics-final">
+                    <tbody>
+                        <tr><th title="Average Travel Time (s) — from engine.get_average_travel_time()">ATT</th><td data-metric="att">—</td></tr>
+                        <tr><th title="Average cars per lane across all steps — engine.get_lane_vehicle_count()">AQL</th><td data-metric="aql">—</td></tr>
+                        <tr><th title="Average Waiting Time (s) — cumulative low-speed time per vehicle, from runner">AWT</th><td data-metric="awt">—</td></tr>
+                        <tr><th>Backend</th><td data-metric="backend">—</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <section class="panel" data-panel="B">
+        <div class="panel-head">
+            <h2>Method B</h2>
+            <select class="replay-select" data-panel="B">
+                <option value="">— Select replay —</option>
+            </select>
+            <button class="load-btn" data-panel="B" disabled>Load</button>
+            <span class="status" data-panel="B">idle</span>
+        </div>
+        <div class="canvas-wrap">
+            <canvas class="map-canvas" data-panel="B"></canvas>
+        </div>
+        <div class="metrics-box" data-panel="B">
+            <div class="metric-group">
+                <h3>Live (this step)</h3>
+                <table class="metrics-live">
+                    <tbody>
+                        <tr><th>AWT (s)</th><td data-metric="awt">—</td></tr>
+                        <tr><th>AQL (veh/lane)</th><td data-metric="aql">—</td></tr>
+                        <tr><th>Throughput</th><td data-metric="throughput">—</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="metric-group">
+                <h3 title="Final metrics computed by the runner from CityFlow engine output">Ground-truth (final)</h3>
+                <table class="metrics-final">
+                    <tbody>
+                        <tr><th title="Average Travel Time (s) — from engine.get_average_travel_time()">ATT</th><td data-metric="att">—</td></tr>
+                        <tr><th title="Average cars per lane across all steps — engine.get_lane_vehicle_count()">AQL</th><td data-metric="aql">—</td></tr>
+                        <tr><th title="Average Waiting Time (s) — cumulative low-speed time per vehicle, from runner">AWT</th><td data-metric="awt">—</td></tr>
+                        <tr><th>Backend</th><td data-metric="backend">—</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+</main>
+
+<section class="timeline-bar">
+    <div class="banner" id="winner-banner">Load 2 replays to start comparison</div>
+    <div class="timeline-controls">
+        <button id="play-btn" disabled>▶ Play</button>
+        <button id="step-back-btn" disabled>‹ Step</button>
+        <button id="step-fwd-btn" disabled>Step ›</button>
+        <label>Speed
+            <select id="speed-select">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="5" selected>5x</option>
+                <option value="10">10x</option>
+                <option value="20">20x</option>
+            </select>
+        </label>
+        <span id="step-display">step 0 / 0</span>
+        <input type="range" id="timeline-slider" min="0" max="0" value="0" disabled />
+    </div>
+</section>
+</div><!-- /.app-viewport -->
+
+<section class="charts">
+    <h3 class="charts-heading">Time-series metrics (scroll down)</h3>
+    <div class="chart-wrap"><canvas id="chart-awt"></canvas></div>
+    <div class="chart-wrap"><canvas id="chart-aql"></canvas></div>
+    <div class="chart-wrap"><canvas id="chart-throughput"></canvas></div>
+</section>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

@@ -690,5 +690,6 @@ class TestModuleConstants:
     def test_valid_methods_includes_lightgpt_hf_and_mine(self):
         assert "lightgpt_hf" in VALID_METHODS
         assert "lightgpt_mine" in VALID_METHODS
+        assert "qwen2_0_5b_base" in VALID_METHODS
         # Old value removed.
         assert "lightgpt_llama3" not in VALID_METHODS

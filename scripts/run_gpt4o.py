@@ -36,7 +36,9 @@ import hashlib
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Ensure src + scripts importable when invoked as ``python scripts/run_gpt4o.py``.
@@ -97,7 +99,21 @@ BACKEND_TO_METHOD: dict[str, str] = {
     "groq": "gpt4o_groq",
     "openai": "gpt4o_openai",
     "codexhub": "gpt4o_codexhub",
+    "ckey": "gpt4o_codexhub",  # ckey.vn is OpenAI-compatible; reuse codexhub method
 }
+
+
+#: Default thread-pool size for parallel intra-cycle API calls. Override via
+#: env ``LLMLIGHT_API_PARALLEL`` (1 = old serial behaviour).
+DEFAULT_API_PARALLEL: int = 12
+
+
+def _api_parallel_workers() -> int:
+    try:
+        n = int(os.environ.get("LLMLIGHT_API_PARALLEL", DEFAULT_API_PARALLEL))
+    except (TypeError, ValueError):
+        n = DEFAULT_API_PARALLEL
+    return max(1, n)
 
 
 def num_runs_for_phase(phase: int) -> int:
@@ -144,6 +160,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Number of runs. Default: Phase 1 = 1, Phase 2/3 = 3 "
             "(Requirement 7 AC 12)."
+        ),
+    )
+    parser.add_argument(
+        "--start-run-id",
+        type=int,
+        default=0,
+        help=(
+            "First run_id to execute (default 0). Set to 1 to run a second "
+            "replicate without overwriting the existing run_0 cache."
         ),
     )
     parser.add_argument(
@@ -267,150 +292,251 @@ def run_simulation(
         + sim_config.all_red_duration
     )
     lane_queues_per_step: list[dict[str, int]] = []
+    # Cumulative wait time per vehicle. We increment by ``decision_cycle_change``
+    # seconds each cycle for every vehicle whose speed < SPEED_THRESHOLD at the
+    # cycle boundary. This is a coarse proxy (one sample per decision cycle,
+    # not per simulation step) but matches the granularity of the rest of the
+    # runner, and the resulting AWT will populate the previously-zero
+    # ``vehicle_wait_times`` channel in MetricsEvaluator.
+    vehicle_wait_seconds: dict[str, float] = {}
     elapsed = 0
     decisions = 0
     phase_time: dict[str, int] = {i: 0 for i in intersections}
     current_phase: dict[str, str] = {i: "ETWT" for i in intersections}
 
-    while elapsed < total_steps:
-        for intersection_id in intersections:
+    # Concurrency for intra-cycle API calls. CityFlow engine itself is NOT
+    # thread-safe (state read + set_phase remain serial); only the LLM calls
+    # are parallelised. Default = number of intersections (one worker per
+    # call) so a full cycle finishes in ~one round-trip latency.
+    # The MultiBackendAPIClient is not strictly thread-safe but the shared
+    # state (counters, key rotation index, inter-request delay) is benign
+    # under contention — torn updates only affect logs/metrics, not correctness.
+    parallel_workers = max(1, min(_api_parallel_workers(), len(intersections)))
+    cache_lock = threading.Lock()
+
+    def _fetch_decision(
+        intersection_id: str,
+        prompt: str,
+        state_hash: str,
+        prompt_hash: str,
+    ) -> dict:
+        """Resolve a single decision (cache hit or fresh API call).
+
+        Safe to call from worker threads — the API client and cache append
+        are serialised by the locks above. Returns a dict with keys
+        ``parsed_phase, raw_response, latency_ms, started_at, received_at,
+        input_tokens, output_tokens, fallback_used, error_type``.
+        """
+        started_at = utc_iso_timestamp()
+        try:
+            if api_cache is not None:
+                with cache_lock:
+                    record = api_cache.get_decision(
+                        elapsed,
+                        intersection_id,
+                        state_hash,
+                        prompt_hash,
+                    )
+                return {
+                    "raw_response": record.raw_response,
+                    "parsed_phase": record.parsed_phase,
+                    "received_at": record.response_received_at,
+                    "latency_ms": record.latency_ms,
+                    "started_at": started_at,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "fallback_used": False,
+                    "error_type": None,
+                }
+            raise APIReplayCacheError("fresh API run")
+        except APIReplayCacheError:
+            if api_client is None:
+                raise RuntimeError(
+                    "run_simulation: api_client is None but cache "
+                    f"miss for t={elapsed} intersection={intersection_id!r}"
+                )
+            if api_cache is not None and not allow_cache_miss_api_call:
+                raise
+            request_start = time.monotonic()
+            api_response = api_client.chat_completion(prompt)
+            latency_ms = max(0, int((time.monotonic() - request_start) * 1000))
+            raw_response = api_response.content
+            parsed_phase = response_parser.parse(raw_response)
+            received_at = utc_iso_timestamp()
+            input_tokens = int(api_response.input_tokens)
+            output_tokens = int(api_response.output_tokens)
+            fallback_used = raw_response == ""
+            error_type = "empty_response" if fallback_used else None
+
+            if api_cache is not None and run_fingerprint is not None:
+                rec = APIDecisionRecord(
+                    run_fingerprint=run_fingerprint,
+                    dataset=dataset,
+                    phase=phase,
+                    mode=mode,
+                    method=method,
+                    backend=backend,
+                    model=model,
+                    run_id=run_id,
+                    seed=seed,
+                    timestep=elapsed,
+                    intersection_id=intersection_id,
+                    state_hash=state_hash,
+                    prompt_hash=prompt_hash,
+                    prompt=prompt,
+                    raw_response=raw_response,
+                    parsed_phase=parsed_phase,
+                    fallback_used=fallback_used,
+                    error_type=error_type,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    request_started_at=started_at,
+                    response_received_at=received_at,
+                    latency_ms=latency_ms,
+                )
+                with cache_lock:
+                    api_cache.append(rec)
+            return {
+                "raw_response": raw_response,
+                "parsed_phase": parsed_phase,
+                "received_at": received_at,
+                "latency_ms": latency_ms,
+                "started_at": started_at,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "fallback_used": fallback_used,
+                "error_type": error_type,
+            }
+
+    executor = (
+        ThreadPoolExecutor(max_workers=parallel_workers)
+        if parallel_workers > 1
+        else None
+    )
+    try:
+        while elapsed < total_steps:
+            # Phase 1: build prompts for every intersection (serial — engine
+            # is not thread-safe). lane_counts is shared across all of them
+            # within a single cycle (one snapshot per cycle).
             try:
                 lane_counts = engine.get_lane_vehicle_count()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "run_simulation: get_lane_vehicle_count failed at t=%d "
-                    "intersection=%s: %s; using empty dict.",
+                    "run_simulation: get_lane_vehicle_count failed at t=%d: "
+                    "%s; using empty dict.",
                     elapsed,
-                    intersection_id,
                     exc,
                 )
                 lane_counts = {}
 
-            state = {
-                "lane_vehicle_count": lane_counts,
-                "current_phase": current_phase[intersection_id],
-                "current_phase_time": phase_time[intersection_id],
-            }
-            prompt = obs_parser.parse(state)
-            state_hash = stable_hash_json(state)
-            prompt_hash = stable_hash_text(prompt)
-            started_at = utc_iso_timestamp()
-            input_tokens = 0
-            output_tokens = 0
-            error_type = None
-            fallback_used = False
+            prompts: dict[str, tuple[dict, str, str, str]] = {}
+            for intersection_id in intersections:
+                state = {
+                    "lane_vehicle_count": lane_counts,
+                    "current_phase": current_phase[intersection_id],
+                    "current_phase_time": phase_time[intersection_id],
+                }
+                prompt = obs_parser.parse(state)
+                state_hash = stable_hash_json(state)
+                prompt_hash = stable_hash_text(prompt)
+                prompts[intersection_id] = (state, prompt, state_hash, prompt_hash)
 
-            if api_client is None:
-                if api_cache is None:
-                    raise RuntimeError(
-                        "run_simulation: api_client is None but no "
-                        "APIReplayCache was provided"
+            # Phase 2: resolve every decision (parallel API calls when needed).
+            results: dict[str, dict] = {}
+            if executor is None:
+                for intersection_id in intersections:
+                    _, prompt, sh, ph = prompts[intersection_id]
+                    results[intersection_id] = _fetch_decision(
+                        intersection_id, prompt, sh, ph,
                     )
-                record = api_cache.get_decision(
-                    elapsed,
-                    intersection_id,
-                    state_hash,
-                    prompt_hash,
-                )
-                raw_response = record.raw_response
-                parsed_phase = record.parsed_phase
-                received_at = record.response_received_at
-                latency_ms = record.latency_ms
             else:
-                try:
-                    if api_cache is not None:
-                        record = api_cache.get_decision(
-                            elapsed,
-                            intersection_id,
-                            state_hash,
-                            prompt_hash,
-                        )
-                        raw_response = record.raw_response
-                        parsed_phase = record.parsed_phase
-                        received_at = record.response_received_at
-                        latency_ms = record.latency_ms
-                    else:
-                        raise APIReplayCacheError("fresh API run")
-                except APIReplayCacheError:
-                    if api_cache is not None and not allow_cache_miss_api_call:
-                        raise
-                    request_start = time.time()
-                    api_response = api_client.chat_completion(prompt)
-                    latency_ms = int((time.time() - request_start) * 1000)
-                    raw_response = api_response.content
-                    parsed_phase = response_parser.parse(raw_response)
-                    received_at = utc_iso_timestamp()
-                    input_tokens = int(api_response.input_tokens)
-                    output_tokens = int(api_response.output_tokens)
-                    fallback_used = raw_response == ""
-                    if fallback_used:
-                        error_type = "empty_response"
+                future_to_id = {
+                    executor.submit(
+                        _fetch_decision,
+                        iid,
+                        prompts[iid][1],
+                        prompts[iid][2],
+                        prompts[iid][3],
+                    ): iid
+                    for iid in intersections
+                }
+                for fut in future_to_id:
+                    iid = future_to_id[fut]
+                    results[iid] = fut.result()
 
-                    if api_cache is not None and run_fingerprint is not None:
-                        api_cache.append(
-                            APIDecisionRecord(
-                                run_fingerprint=run_fingerprint,
-                                dataset=dataset,
-                                phase=phase,
-                                mode=mode,
-                                method=method,
-                                backend=backend,
-                                model=model,
-                                run_id=run_id,
-                                seed=seed,
-                                timestep=elapsed,
-                                intersection_id=intersection_id,
-                                state_hash=state_hash,
-                                prompt_hash=prompt_hash,
-                                prompt=prompt,
-                                raw_response=raw_response,
-                                parsed_phase=parsed_phase,
-                                fallback_used=fallback_used,
-                                error_type=error_type,
-                                input_tokens=input_tokens,
-                                output_tokens=output_tokens,
-                                request_started_at=started_at,
-                                response_received_at=received_at,
-                                latency_ms=latency_ms,
-                            )
-                        )
+            # Phase 3: log + apply phase (serial — engine.set_phase not
+            # thread-safe; preserve original intersection order so behaviour
+            # matches the serial loop).
+            for intersection_id in intersections:
+                _state, prompt, _sh, _ph = prompts[intersection_id]
+                outcome = results[intersection_id]
+                raw_response = outcome["raw_response"]
+                parsed_phase = outcome["parsed_phase"]
+                try:
+                    log_llm_prompt(
+                        dataset=dataset,
+                        method=method,
+                        run_id=run_id,
+                        timestep=elapsed,
+                        intersection_id=intersection_id,
+                        prompt=prompt,
+                        raw_response=raw_response,
+                        parsed_phase=parsed_phase,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "run_simulation: failed to log LLM prompt: %s", exc
+                    )
+
+                phase_idx = phase_mapper.get_index(intersection_id, parsed_phase)
+                previous = current_phase[intersection_id]
+                engine.set_phase(intersection_id, phase_idx)
+                decisions += 1
+
+                if parsed_phase != previous:
+                    current_phase[intersection_id] = parsed_phase
+                    phase_time[intersection_id] = sim_config.green_duration
+                else:
+                    phase_time[intersection_id] += sim_config.green_duration
 
             try:
-                log_llm_prompt(
-                    dataset=dataset,
-                    method=method,
-                    run_id=run_id,
-                    timestep=elapsed,
-                    intersection_id=intersection_id,
-                    prompt=prompt,
-                    raw_response=raw_response,
-                    parsed_phase=parsed_phase,
+                lane_queues_per_step.append(dict(engine.get_lane_vehicle_count()))
+            except Exception:  # noqa: BLE001
+                lane_queues_per_step.append({})
+
+            # Sample per-vehicle speeds at the cycle boundary and accumulate
+            # cumulative wait time. SPEED_THRESHOLD matches MetricsEvaluator.
+            raw_engine = getattr(engine, "_engine", engine)
+            try:
+                speeds = raw_engine.get_vehicle_speed()
+            except Exception:  # noqa: BLE001
+                speeds = {}
+            if speeds:
+                for vid, spd in speeds.items():
+                    if spd < MetricsEvaluator.SPEED_THRESHOLD:
+                        vehicle_wait_seconds[str(vid)] = (
+                            vehicle_wait_seconds.get(str(vid), 0.0)
+                            + float(decision_cycle_change)
+                        )
+                    else:
+                        vehicle_wait_seconds.setdefault(str(vid), 0.0)
+
+            elapsed += decision_cycle_change
+
+            if elapsed % (decision_cycle_change * 5) == 0:
+                logger.info(
+                    "run_simulation: progress dataset=%s run_id=%d t=%d/%d "
+                    "decisions=%d",
+                    dataset, run_id, elapsed, total_steps, decisions,
                 )
-            except OSError as exc:
-                logger.warning(
-                    "run_simulation: failed to log LLM prompt: %s", exc
-                )
-
-            phase_idx = phase_mapper.get_index(intersection_id, parsed_phase)
-            previous = current_phase[intersection_id]
-            engine.set_phase(intersection_id, phase_idx)
-            decisions += 1
-
-            if parsed_phase != previous:
-                current_phase[intersection_id] = parsed_phase
-                phase_time[intersection_id] = sim_config.green_duration
-            else:
-                phase_time[intersection_id] += sim_config.green_duration
-
-        try:
-            lane_queues_per_step.append(dict(engine.get_lane_vehicle_count()))
-        except Exception:  # noqa: BLE001
-            lane_queues_per_step.append({})
-
-        elapsed += decision_cycle_change
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     metrics = MetricsEvaluator(total_timesteps=total_steps).evaluate(
-        engine=engine, lane_queues_per_step=lane_queues_per_step
+        engine=engine,
+        lane_queues_per_step=lane_queues_per_step,
+        vehicle_wait_times=list(vehicle_wait_seconds.values()),
     )
     return metrics, decisions
 
@@ -477,7 +603,7 @@ def _backend_for_token_usage(backend: object) -> APIBackend:
     """Cast backend marker to one of the literals accepted by
     :class:`TokenUsageLog`."""
     val = _backend_value(backend)
-    if val not in ("puter", "groq", "openai", "codexhub"):
+    if val not in ("puter", "groq", "openai", "codexhub", "ckey"):
         raise ValueError(
             f"_backend_for_token_usage: invalid backend {backend!r}"
         )
@@ -612,7 +738,12 @@ def main(
 
     # ---- 7) Resolve num_runs (phase-aware default) ---------------------
     num_runs = args.num_runs if args.num_runs is not None else num_runs_for_phase(args.phase)
-    run_ids = [reuse_manifest.run_id] if reuse_manifest is not None else list(range(num_runs))
+    start = max(0, int(args.start_run_id))
+    run_ids = (
+        [reuse_manifest.run_id]
+        if reuse_manifest is not None
+        else list(range(start, start + num_runs))
+    )
 
     # ---- 8) Lazy-import CityFlow engine factory ------------------------
     if cityflow_engine_factory is None:
@@ -653,6 +784,28 @@ def main(
             )
         )
         run_cache = reuse_cache if reuse_cache is not None else APIReplayCache()
+        # Resume support: load any existing JSONL records for this run so we
+        # don't re-spend API quota on previously-cached decisions.
+        if reuse_cache is None:
+            try:
+                loaded = run_cache.load_existing(
+                    dataset=args.dataset,
+                    method=method,
+                    phase=args.phase,
+                    run_id=run_id,
+                )
+                if loaded:
+                    logger.info(
+                        "run_gpt4o: resuming run_id=%d with %d cached decisions.",
+                        run_id,
+                        loaded,
+                    )
+            except (OSError, ValueError, APIReplayCacheError) as exc:
+                logger.warning(
+                    "run_gpt4o: could not load existing cache for run_id=%d: %s",
+                    run_id,
+                    exc,
+                )
 
         cityflow_config_path = build_cityflow_config_path(
             args.dataset, llmtscs_dir=llmtscs_dir, seed=seed
@@ -708,11 +861,31 @@ def main(
         )
         duration = time.time() - start_time
 
+        # Move CityFlow replay artefacts out of the ASCII staging dir.
+        try:
+            moved = engine.finalize_replay() if hasattr(engine, "finalize_replay") else None
+            if moved:
+                logger.info("run_gpt4o: replay file finalized at %s", moved)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("run_gpt4o: finalize_replay failed: %s", exc)
+
         usage = (
             reuse_manifest.token_usage
             if api_client is None
             else api_client.get_usage_log()
         )
+        # When a fresh run resumed from a partially-filled cache, the live
+        # client usage only counts the NEW calls. The on-disk JSONL is the
+        # source of truth — re-aggregate across every cached decision so the
+        # manifest reflects the full run cost.
+        if reuse_manifest is None:
+            cached_in, cached_out, cached_count = run_cache.aggregate_token_usage()
+            usage = APITokenUsageLog(
+                total_input_tokens=cached_in,
+                total_output_tokens=cached_out,
+                total_requests=cached_count,
+                backend=backend,
+            )
         total_tokens = usage.total_input_tokens + usage.total_output_tokens
         logger.info(
             "run_gpt4o: completed method=%s run_id=%d decisions=%d "

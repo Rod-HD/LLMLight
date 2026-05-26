@@ -294,7 +294,7 @@ class TestParseArgs:
             )
 
     def test_method_choices(self):
-        for m in ("lightgpt_hf", "lightgpt_mine", "both"):
+        for m in ("lightgpt_hf", "lightgpt_mine", "qwen2_0_5b_base", "both"):
             ns = run_lightgpt.parse_args(
                 ["--dataset", "jinan_1", "--method", m]
             )

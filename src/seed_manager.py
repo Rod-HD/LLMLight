@@ -46,19 +46,28 @@ logger = logging.getLogger(__name__)
 # chạy trong WSL2). Ở runtime production (WSL2 venv), cả hai đều tồn tại.
 # ---------------------------------------------------------------------------
 
-_numpy: Any | None
-try:
-    import numpy as _numpy  # type: ignore[import-not-found]
-except Exception as _np_exc:  # pragma: no cover - depends on env
-    _numpy = None
-    logger.debug("numpy not importable: %s", _np_exc)
+def _lazy_numpy() -> Any | None:
+    try:
+        import numpy as _numpy  # type: ignore[import-not-found]
+        return _numpy
+    except Exception as exc:  # pragma: no cover
+        logger.debug("numpy not importable: %s", exc)
+        return None
 
-_torch: Any | None
-try:
-    import torch as _torch  # type: ignore[import-not-found]
-except Exception as _torch_exc:  # pragma: no cover - depends on env
-    _torch = None
-    logger.debug("torch not importable: %s", _torch_exc)
+
+def _lazy_torch() -> Any | None:
+    # Lazy import: avoid triggering CUDA init at module import time.
+    # torch spawns a GPU polling thread on import when CUDA is present,
+    # which hangs indefinitely in WSL2 via /dev/dxg poll().
+    # Skip entirely when LLMLIGHT_NO_TORCH_SEED is set (Phase 2 API runs).
+    if os.environ.get("LLMLIGHT_NO_TORCH_SEED"):
+        return None
+    try:
+        import torch as _torch  # type: ignore[import-not-found]
+        return _torch
+    except Exception as exc:  # pragma: no cover
+        logger.debug("torch not importable: %s", exc)
+        return None
 
 
 class SeedManager:
@@ -148,6 +157,7 @@ class SeedManager:
         random.seed(seed)
 
         # 3) NumPy
+        _numpy = _lazy_numpy()
         if _numpy is not None:
             try:
                 _numpy.random.seed(seed)
@@ -156,7 +166,8 @@ class SeedManager:
         else:
             logger.debug("numpy not available; skipping numpy seed.")
 
-        # 4) PyTorch (CPU + CUDA)
+        # 4) PyTorch (CPU + CUDA) — lazy import to avoid CUDA init at module load
+        _torch = _lazy_torch()
         if _torch is not None:
             try:
                 _torch.manual_seed(seed)
@@ -167,8 +178,6 @@ class SeedManager:
                 if _torch.cuda.is_available():
                     _torch.cuda.manual_seed_all(seed)
             except Exception as exc:  # pragma: no cover - defensive
-                # ``cuda.is_available()`` itself can raise on misconfigured
-                # installs (e.g., driver mismatch). Treat as no-CUDA case.
                 logger.debug(
                     "torch.cuda check failed (%s); skipping CUDA seed.",
                     exc,

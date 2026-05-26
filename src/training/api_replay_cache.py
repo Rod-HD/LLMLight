@@ -282,6 +282,31 @@ class APIReplayCache:
             ".manifest.json"
         )
 
+    def load_existing(
+        self, dataset: str, method: str, phase: int, run_id: int
+    ) -> int:
+        """Load any existing JSONL cache records into memory.
+
+        Used to resume an interrupted run: previously-cached decisions become
+        replayable via ``get_decision`` while new decisions still append to
+        the same file. Returns the number of records loaded (0 if the file
+        does not exist).
+        """
+        path = self.jsonl_path_for(dataset, method, phase, run_id)
+        if not path.exists():
+            return 0
+        self._records = self._load_records(path, allow_duplicates=True)
+        return len(self._records)
+
+    def aggregate_token_usage(self) -> tuple[int, int, int]:
+        """Sum ``input_tokens``, ``output_tokens`` and request count across
+        all currently-loaded records. Used by the runner to build an accurate
+        manifest when resuming a partially-completed run.
+        """
+        total_in = sum(r.input_tokens for r in self._records.values())
+        total_out = sum(r.output_tokens for r in self._records.values())
+        return total_in, total_out, len(self._records)
+
     def append(self, record: APIDecisionRecord) -> Path:
         path = self.jsonl_path_for(
             record.dataset, record.method, record.phase, record.run_id
@@ -396,7 +421,10 @@ class APIReplayCache:
                 f"expected {manifest.jsonl_sha256}, got {actual_sha}"
             )
         self._manifest = manifest
-        self._records = self._load_records(jsonl_path)
+        # allow_duplicates=True: parallel writes from earlier interrupted runs
+        # may have written multiple records for the same (timestep, intersection)
+        # — keep last-wins so resume + replay are robust.
+        self._records = self._load_records(jsonl_path, allow_duplicates=True)
         return manifest
 
     def get_decision(
@@ -453,7 +481,15 @@ class APIReplayCache:
         return False
 
     @staticmethod
-    def _load_records(path: Path) -> dict[tuple[int, str], APIDecisionRecord]:
+    def _load_records(
+        path: Path, *, allow_duplicates: bool = False
+    ) -> dict[tuple[int, str], APIDecisionRecord]:
+        """Load all records from a JSONL cache file.
+
+        When ``allow_duplicates`` is True, later records overwrite earlier
+        ones with the same (timestep, intersection_id) key — needed when
+        resuming interrupted runs that may have re-attempted some steps.
+        """
         records: dict[tuple[int, str], APIDecisionRecord] = {}
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -462,7 +498,7 @@ class APIReplayCache:
                     continue
                 record = APIDecisionRecord.from_dict(json.loads(stripped))
                 key = (record.timestep, record.intersection_id)
-                if key in records:
+                if not allow_duplicates and key in records:
                     raise ValueError(
                         "Duplicate API cache record at "
                         f"line {line_number}: timestep={record.timestep}, "
@@ -470,6 +506,36 @@ class APIReplayCache:
                     )
                 records[key] = record
         return records
+
+    def compact(
+        self, dataset: str, method: str, phase: int, run_id: int
+    ) -> int:
+        """Rewrite the JSONL cache file with duplicate keys removed (last wins).
+
+        Returns the number of unique records kept. Used after an interrupted
+        run wrote multiple records for the same (timestep, intersection_id).
+        """
+        path = self.jsonl_path_for(dataset, method, phase, run_id)
+        if not path.exists():
+            return 0
+        records = self._load_records(path, allow_duplicates=True)
+        # Sort by (timestep, intersection_id) for stable, readable output.
+        ordered = sorted(records.values(), key=lambda r: (r.timestep, r.intersection_id))
+        tmp = path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            for record in ordered:
+                handle.write(
+                    json.dumps(
+                        record.to_dict(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                handle.write("\n")
+        tmp.replace(path)
+        self._records = records
+        return len(records)
 
 
 __all__ = [

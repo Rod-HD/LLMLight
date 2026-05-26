@@ -1,0 +1,313 @@
+:root {
+    --bg: #f5f6f8;
+    --panel-bg: #ffffff;
+    --border: #d8dce3;
+    --text: #1f2430;
+    --text-dim: #5b6373;
+    --accent: #3b82f6;
+    --good: #16a34a;
+    --bad: #dc2626;
+    --neutral: #6b7280;
+    --map-bg: #e8ecf3;
+    --road: #c8cfdb;
+    --intersection: #aab2c0;
+}
+
+body.high-contrast {
+    --bg: #0d1117;
+    --panel-bg: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #9da5b4;
+    --map-bg: #08090c;
+    --road: #2a3140;
+    --intersection: #3a4252;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+
+body {
+    display: block;
+    overflow-y: auto;
+}
+
+/* ── Above-the-fold "app viewport" — header + panels + timeline fill 100vh ── */
+.app-viewport {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.app-header {
+    flex: 0 0 auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 12px;
+    background: var(--panel-bg);
+    border-bottom: 1px solid var(--border);
+}
+
+.app-header h1 {
+    font-size: 13px;
+    margin: 0;
+    font-weight: 600;
+}
+
+.header-controls {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    font-size: 11px;
+}
+
+.header-controls input[type="range"] {
+    width: 90px;
+}
+
+.header-controls label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-dim);
+}
+
+.panels {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3px;
+    padding: 3px;
+    min-height: 0;
+}
+
+.panel {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.panel-head {
+    padding: 3px 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+
+.panel-head h2 {
+    font-size: 11px;
+    margin: 0;
+    color: var(--text-dim);
+    min-width: 50px;
+    white-space: nowrap;
+}
+
+.replay-select {
+    flex: 1 1 auto;
+    padding: 2px 5px;
+    font-size: 11px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg);
+    color: var(--text);
+    min-width: 0;
+}
+
+.load-btn {
+    padding: 2px 8px;
+    font-size: 11px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: white;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.load-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.status {
+    font-size: 10px;
+    color: var(--text-dim);
+    min-width: 70px;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px;
+}
+
+/* Canvas wrap: MUST clip overflow so Pixi canvas can't bleed into the
+   metrics box below it. */
+.canvas-wrap {
+    flex: 1 1 auto;
+    position: relative;
+    min-height: 0;
+    background: var(--map-bg);
+    overflow: hidden;
+}
+
+.map-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* Metrics box: live + ground-truth side-by-side (horizontal), compact. */
+.metrics-box {
+    flex: 0 0 auto;
+    padding: 4px 8px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: row;
+    gap: 16px;
+    font-size: 11px;
+    align-items: flex-start;
+}
+
+.metric-group {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.metric-group h3 {
+    font-size: 10px;
+    margin: 0 0 2px 0;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.metrics-box table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.metrics-box th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--text-dim);
+    padding: 1px 4px 1px 0;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.metrics-box td {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    padding: 1px 0;
+    font-size: 11px;
+}
+
+.metrics-box td.winner {
+    color: var(--good);
+    font-weight: 700;
+}
+
+.metrics-box td.loser {
+    color: var(--text-dim);
+}
+
+.timeline-bar {
+    flex: 0 0 auto;
+    background: var(--panel-bg);
+    border-top: 1px solid var(--border);
+    padding: 4px 12px;
+}
+
+.banner {
+    font-size: 11px;
+    margin-bottom: 3px;
+    color: var(--text-dim);
+}
+
+.banner.A-leads { color: var(--good); }
+.banner.B-leads { color: var(--good); }
+.banner.tied { color: var(--neutral); }
+
+.timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+}
+
+.timeline-controls button {
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+}
+
+.timeline-controls select {
+    padding: 1px 4px;
+    font-size: 11px;
+    border-radius: 3px;
+}
+
+.timeline-controls button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.timeline-controls #timeline-slider {
+    flex: 1 1 auto;
+}
+
+.timeline-controls #step-display {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-dim);
+    min-width: 120px;
+}
+
+/* Charts live BELOW the 100vh viewport — user scrolls to reach them. */
+.charts {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    padding: 16px;
+    background: var(--panel-bg);
+    border-top: 2px solid var(--border);
+    height: 320px;
+}
+
+.charts-heading {
+    grid-column: 1 / -1;
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-dim);
+}
+
+.chart-wrap {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px;
+    min-width: 0;
+    position: relative;
+}

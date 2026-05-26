@@ -419,11 +419,9 @@ class TestRetryOn429:
 
     def test_429_three_times_returns_empty(self, monkeypatch, noop_sleep, caplog):
         monkeypatch.setenv("OPENAI_API_KEY", "sk")
-        recorder = _Recorder([
-            _err_response(429),
-            _err_response(429),
-            _err_response(429),
-        ])
+        # Send MAX_RETRIES (=5) consecutive 429s so retries are exhausted.
+        max_retries = MultiBackendAPIClient.MAX_RETRIES
+        recorder = _Recorder([_err_response(429) for _ in range(max_retries)])
         client = MultiBackendAPIClient(
             env_path=NONEXISTENT_ENV,
             mode="demo",
@@ -440,9 +438,9 @@ class TestRetryOn429:
         assert resp.input_tokens == 0
         assert resp.output_tokens == 0
         assert resp.backend is APIBackend.OPENAI
-        # 3 attempts, only 2 sleeps in between (no sleep after final attempt).
-        assert noop_sleep.calls == [60.0, 60.0]
-        assert len(recorder.calls) == 3
+        # N attempts, only N-1 sleeps in between (no sleep after final attempt).
+        assert noop_sleep.calls == [60.0] * (max_retries - 1)
+        assert len(recorder.calls) == max_retries
         # Warning logs mention rate-limit / HTTP 429.
         warnings = [r.getMessage() for r in caplog.records
                     if r.levelno == logging.WARNING]

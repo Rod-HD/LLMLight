@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -90,6 +91,13 @@ _DEFAULT_ALL_RED_DURATION = 2
 #: Đường dẫn relative tới project root nơi ghi replay file (ổ D mounted
 #: tại /mnt/d/ trong WSL2). Resolve relative tới CWD tại runtime.
 _REPLAY_DIR = Path("results") / "replays"
+
+#: CityFlow native (C++) does not handle non-ASCII paths reliably (fopen
+#: silently fails on UTF-8 chars like "Trí tuệ", "Đồ án"). We write replay
+#: files into an ASCII-safe staging directory and then move them into
+#: ``_REPLAY_DIR`` when the engine closes. Override via env var
+#: ``LLMLIGHT_REPLAY_STAGING_DIR`` if needed.
+_REPLAY_STAGING_DIR = Path("/tmp/llmlight_replays")
 
 
 class CityFlowEngine:
@@ -275,6 +283,46 @@ class CityFlowEngine:
         self._engine.next_step()
         self._refresh_vehicle_tracking()
 
+    def finalize_replay(self) -> str | None:
+        """Move replay files from the ASCII staging dir to the final
+        project-scoped directory. No-op when ``save_replay=False``.
+
+        CityFlow native (C++) cannot fopen() paths that contain non-ASCII
+        bytes, so the engine writes into ``/tmp/llmlight_replays/``. After
+        the simulator finishes we relocate the artefacts back next to the
+        rest of the experiment outputs.
+
+        Returns the final replay file path on success, ``None`` otherwise.
+        """
+        if not self.save_replay:
+            return None
+        staging = getattr(self, "_staging_replay", None)
+        final = getattr(self, "_final_replay", None)
+        if staging is None or final is None:
+            return None
+        moved = None
+        try:
+            if staging.exists():
+                final.parent.mkdir(parents=True, exist_ok=True)
+                if final.exists():
+                    final.unlink()
+                # shutil.move handles cross-device moves (tmpfs → mounted ext4)
+                # that Path.replace cannot.
+                shutil.move(str(staging), str(final))
+                moved = str(final)
+            staging_road = getattr(self, "_staging_roadnet", None)
+            final_road = getattr(self, "_final_roadnet", None)
+            if staging_road is not None and staging_road.exists() and final_road is not None:
+                if final_road.exists():
+                    final_road.unlink()
+                shutil.move(str(staging_road), str(final_road))
+        except OSError as exc:
+            logger.warning(
+                "CityFlowEngine.finalize_replay: failed to move staging "
+                "replay to final location: %s", exc,
+            )
+        return moved
+
     def get_lane_vehicle_count(self) -> dict[str, int]:
         """Return số xe trên mỗi lane.
 
@@ -437,41 +485,68 @@ class CityFlowEngine:
         File config copy được đặt cùng thư mục với replay file để CityFlow
         resolve relative paths đúng (``dir`` field trong CityFlow config).
         """
-        replay_dir = (Path.cwd() / _REPLAY_DIR).resolve()
-        replay_dir.mkdir(parents=True, exist_ok=True)
+        # Final destination (project-scoped, may contain Unicode)
+        final_replay_dir = (Path.cwd() / _REPLAY_DIR).resolve()
+        final_replay_dir.mkdir(parents=True, exist_ok=True)
+
+        # Staging dir (ASCII-only — CityFlow native fopen barfs on UTF-8 paths).
+        # CityFlow's C++ prepends ``dir`` to ``roadnetLogFile``/``replayLogFile``
+        # regardless of whether the latter is absolute, so we set ``dir`` itself
+        # to an ASCII path. The roadnet/flow JSONs are copied here too so the
+        # whole engine works without ever touching the Unicode source paths.
+        staging_dir_str = os.environ.get(
+            "LLMLIGHT_REPLAY_STAGING_DIR", str(_REPLAY_STAGING_DIR)
+        )
+        staging_dir = Path(staging_dir_str).resolve()
+        staging_dir.mkdir(parents=True, exist_ok=True)
 
         replay_basename = f"{dataset}_{method}_run{run_id}"
-        replay_log = replay_dir / f"{replay_basename}.txt"
-        roadnet_log = replay_dir / f"{replay_basename}_roadnet.json"
-        config_copy_path = replay_dir / f"{replay_basename}_config.json"
+        replay_log_name = f"{replay_basename}.txt"
+        roadnet_log_name = f"{replay_basename}_roadnet.json"
+        staging_replay = staging_dir / replay_log_name
+        staging_roadnet = staging_dir / roadnet_log_name
+        # Config copy goes to staging too so CityFlow opens it via an
+        # ASCII-only absolute path.
+        config_copy_path = staging_dir / f"{replay_basename}_config.json"
+        final_replay = final_replay_dir / replay_log_name
 
-        # CityFlow uses ``dir`` as base prefix and resolves
-        # ``roadnetLogFile`` / ``replayLogFile`` relative to it. Keep
-        # original ``dir`` (it points at the dataset folder) and use
-        # absolute paths for the log files via overriding to absolute.
-        # Concretely: we set the log filenames to be absolute paths
-        # (CityFlow accepts absolute paths in these fields) so the
-        # ``dir`` + filename concatenation still resolves correctly even
-        # if dir has trailing slash.
+        # Stage roadnet + flow data files (CityFlow concatenates ``dir`` with
+        # roadnetFile/flowFile; we want those reads to also use the ASCII path).
+        src_dir = Path(config_data.get("dir", "")).resolve()
+        src_roadnet = src_dir / config_data["roadnetFile"]
+        src_flow = src_dir / config_data["flowFile"]
+        staging_roadnet_src = staging_dir / config_data["roadnetFile"]
+        staging_flow_src = staging_dir / config_data["flowFile"]
+        if not staging_roadnet_src.exists() or staging_roadnet_src.stat().st_size != src_roadnet.stat().st_size:
+            staging_roadnet_src.write_bytes(src_roadnet.read_bytes())
+        if not staging_flow_src.exists() or staging_flow_src.stat().st_size != src_flow.stat().st_size:
+            staging_flow_src.write_bytes(src_flow.read_bytes())
+
         new_config = dict(config_data)
+        new_config["dir"] = str(staging_dir) + "/"
+        new_config["roadnetFile"] = config_data["roadnetFile"]
+        new_config["flowFile"] = config_data["flowFile"]
         new_config["saveReplay"] = True
-        new_config["roadnetLogFile"] = str(roadnet_log)
-        new_config["replayLogFile"] = str(replay_log)
+        new_config["roadnetLogFile"] = roadnet_log_name
+        new_config["replayLogFile"] = replay_log_name
 
-        # Persist the copy.
         config_copy_path.write_text(
             json.dumps(new_config, indent=2),
             encoding="utf-8",
         )
 
+        self._staging_replay = staging_replay
+        self._staging_roadnet = staging_roadnet
+        self._final_replay = final_replay
+        self._final_roadnet = final_replay_dir / roadnet_log_name
+
         logger.info(
-            "CityFlowEngine: save_replay=True; replay file will be "
-            "written to %s (config copy at %s)",
-            replay_log,
-            config_copy_path,
+            "CityFlowEngine: save_replay=True; staging at %s (will move to %s)",
+            staging_replay,
+            final_replay,
         )
 
-        return str(config_copy_path), str(replay_log)
+        return str(config_copy_path), str(final_replay)
 
 
 __all__ = ["CityFlowEngine"]

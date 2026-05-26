@@ -16,7 +16,7 @@ Strategy:
 Tests coverage:
 
 1. :class:`TrainingConfig` defaults match Requirement 6 AC 1, 3.
-2. :class:`TrainingConfig` validates ``ift_epochs`` ∈ [3, 10].
+2. :class:`TrainingConfig` validates ``ift_epochs`` ∈ [3, 30].
 3. :class:`TrainingConfig` validates ``lora_rank`` > 0,
    ``lora_alpha`` > 0, ``gradient_accumulation_steps`` >= 4.
 4. :class:`TrainingConfig` validates ``lora_target_modules`` is non-empty
@@ -91,6 +91,23 @@ class _FakeTokenizer:
     ):
         # Toy tokenization: 1 token per character (deterministic).
         ids = list(range(1, min(len(text), max_length or len(text)) + 1))
+        return {"input_ids": ids}
+
+
+class _OrdTokenizer(_FakeTokenizer):
+    """Tokenizer that preserves character identity for truncation tests."""
+
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = True,
+        truncation: bool = False,
+        max_length: int | None = None,
+        **kwargs,
+    ):
+        ids = [ord(ch) for ch in text]
+        if truncation and max_length is not None:
+            ids = ids[:max_length]
         return {"input_ids": ids}
 
 
@@ -211,6 +228,7 @@ def _make_fake_transformers():
     fake.Trainer = _RecordingTrainer
     fake.TrainingArguments = _RecordingTrainingArguments
     fake.DataCollatorForLanguageModeling = _FakeDataCollator
+    fake.DataCollatorForSeq2Seq = _FakeDataCollator
     return fake
 
 
@@ -331,19 +349,20 @@ class TestTrainingConfigDefaults:
         assert c.lora_rank == 8
         assert c.lora_alpha == 16
         assert c.lora_target_modules == ("q_proj", "v_proj")
-        assert c.gradient_accumulation_steps >= 4
+        assert c.gradient_accumulation_steps == 128
         assert c.batch_size == 1
-        assert 3 <= c.ift_epochs <= 10
+        assert c.ift_epochs == 30
+        assert c.max_seq_length == 2048
+        assert c.learning_rate == 3e-4
+        assert c.train_on_inputs is True
         assert c.checkpoint_dir
         assert c.output_dir
-        assert c.max_seq_length >= 1
-        assert c.learning_rate > 0
 
 
 class TestTrainingConfigValidation:
     """``__post_init__`` raises on invalid values."""
 
-    @pytest.mark.parametrize("bad_epochs", [0, 1, 2, 11, 100, -1])
+    @pytest.mark.parametrize("bad_epochs", [0, 1, 2, 31, 100, -1])
     def test_invalid_epochs_rejected(self, bad_epochs):
         with pytest.raises(ValueError, match="ift_epochs"):
             TrainingConfig(ift_epochs=bad_epochs)
@@ -385,6 +404,11 @@ class TestTrainingConfigValidation:
         with pytest.raises(ValueError, match="learning_rate"):
             TrainingConfig(learning_rate=bad_lr)
 
+    @pytest.mark.parametrize("bad_train_on_inputs", ["true", 1, None])
+    def test_invalid_train_on_inputs_rejected(self, bad_train_on_inputs):
+        with pytest.raises(TypeError, match="train_on_inputs"):
+            TrainingConfig(train_on_inputs=bad_train_on_inputs)
+
     def test_empty_checkpoint_dir_rejected(self):
         with pytest.raises(ValueError, match="checkpoint_dir"):
             TrainingConfig(checkpoint_dir="")
@@ -394,9 +418,9 @@ class TestTrainingConfigValidation:
             TrainingConfig(output_dir="")
 
     def test_min_max_epochs_inclusive(self):
-        # 3 and 10 must be accepted (boundary).
+        # 3 and 30 must be accepted (boundary).
         TrainingConfig(ift_epochs=3)
-        TrainingConfig(ift_epochs=10)
+        TrainingConfig(ift_epochs=30)
 
 
 # =========================================================================
@@ -419,7 +443,7 @@ class TestIFTTrainerInit:
 
     def test_min_max_epochs_constants(self):
         assert IFTTrainer.MIN_EPOCHS == 3
-        assert IFTTrainer.MAX_EPOCHS == 10
+        assert IFTTrainer.MAX_EPOCHS == 30
 
 
 # =========================================================================
@@ -512,8 +536,55 @@ class TestTrainCallsTrainer:
         assert kw["per_device_train_batch_size"] == 1
         assert kw["gradient_accumulation_steps"] == 8
         assert kw["learning_rate"] == 1e-4
+        assert kw["warmup_steps"] == 10
+        assert kw["group_by_length"] is True
         assert kw["save_strategy"] == "epoch"  # Requirement 6 AC 6
         assert kw["output_dir"] == runtime_dirs["checkpoint_dir"]
+
+    def test_build_dataset_trains_on_inputs_by_default(
+        self,
+        runtime_dirs,
+        small_data,
+    ):
+        c = TrainingConfig(**runtime_dirs)
+        t = IFTTrainer(c)
+        dataset = t._build_dataset(small_data, _FakeTokenizer(), _FakeDatasets())
+
+        first = dataset.records[0]
+        assert first["labels"] == first["input_ids"]
+        assert -100 not in first["labels"]
+
+    def test_build_dataset_can_mask_inputs_for_legacy_mode(
+        self,
+        runtime_dirs,
+        small_data,
+    ):
+        c = TrainingConfig(train_on_inputs=False, **runtime_dirs)
+        t = IFTTrainer(c)
+        dataset = t._build_dataset(small_data, _FakeTokenizer(), _FakeDatasets())
+
+        first = dataset.records[0]
+        prompt_len = min(len(small_data[0][0]), len(first["input_ids"]))
+        assert first["labels"][:prompt_len] == [-100] * prompt_len
+        assert first["labels"][prompt_len:] == first["input_ids"][prompt_len:]
+
+    def test_build_dataset_preserves_response_when_prompt_exceeds_cutoff(
+        self,
+        runtime_dirs,
+    ):
+        c = TrainingConfig(max_seq_length=32, **runtime_dirs)
+        t = IFTTrainer(c)
+        dataset = t._build_dataset(
+            [("p" * 200, "<signal>ETWT</signal>")],
+            _OrdTokenizer(),
+            _FakeDatasets(),
+        )
+
+        first = dataset.records[0]
+        expected_tail = [ord(ch) for ch in "<signal>ETWT</signal>"] + [0]
+        assert len(first["input_ids"]) == 32
+        assert first["input_ids"][-len(expected_tail):] == expected_tail
+        assert first["labels"] == first["input_ids"]
 
     def test_lora_config_uses_target_modules_q_v_proj(
         self,
@@ -609,8 +680,9 @@ class TestTrainCallsTrainer:
                 "attention_mask",
                 "labels",
             }
-            # Prompt portion must be masked with -100.
-            assert -100 in rec_row["labels"]
+            # Paper-style default trains on the full sequence.
+            assert rec_row["labels"] == rec_row["input_ids"]
+            assert -100 not in rec_row["labels"]
 
 
 # =========================================================================

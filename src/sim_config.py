@@ -53,6 +53,7 @@ APIBackend = Literal["puter", "groq", "openai", "codexhub", "none"]
 Method = Literal[
     "lightgpt_hf",
     "lightgpt_mine",
+    "qwen2_0_5b_base",
     "gpt4o_puter",
     "gpt4o_groq",
     "gpt4o_openai",
@@ -67,9 +68,11 @@ VALID_METHODS: frozenset[str] = frozenset(
     [
         "lightgpt_hf",
         "lightgpt_mine",
+        "qwen2_0_5b_base",
         "gpt4o_puter",
         "gpt4o_groq",
         "gpt4o_openai",
+        "gpt4o_codexhub",
         "maxpressure",
         "advanced_maxpressure",
         "advanced_colight",

@@ -5,14 +5,17 @@
     "rank": 8,
     "alpha": 16,
     "target_modules": ["q_proj", "v_proj"],
-    "gradient_accumulation_steps": 4,
+    "gradient_accumulation_steps": 128,
     "batch_size": 1
   },
 
   "ift": {
     "_comment": "Instruction Fine-Tuning trên trajectory data (Requirement 6.1). Checkpoint mỗi epoch boundary, hỗ trợ resume.",
     "min_epochs": 3,
-    "max_epochs": 10,
+    "max_epochs": 30,
+    "learning_rate": 0.0003,
+    "max_seq_length": 2048,
+    "train_on_inputs": true,
     "checkpoint_dir": "checkpoints/ift"
   },
 

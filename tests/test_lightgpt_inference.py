@@ -325,7 +325,9 @@ class TestInit:
             )
 
     def test_valid_variants_constant(self):
-        assert VALID_VARIANTS == frozenset({"lightgpt_hf", "lightgpt_mine"})
+        assert VALID_VARIANTS == frozenset(
+            {"lightgpt_hf", "lightgpt_mine", "qwen2_0_5b_base"}
+        )
 
 
 # =========================================================================

@@ -96,10 +96,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Subset of methods this runner produces (excludes baselines / GPT-4o).
-LIGHTGPT_METHODS: tuple[str, ...] = ("lightgpt_hf", "lightgpt_mine")
+LIGHTGPT_METHODS: tuple[str, ...] = (
+    "lightgpt_hf",
+    "lightgpt_mine",
+    "qwen2_0_5b_base",
+)
 
 #: ``--method`` accepts these literal values from the user.
-METHOD_CHOICES: tuple[str, ...] = ("lightgpt_hf", "lightgpt_mine", "both")
+METHOD_CHOICES: tuple[str, ...] = (
+    "lightgpt_hf",
+    "lightgpt_mine",
+    "qwen2_0_5b_base",
+    "both",
+)
 
 #: Path to ``models/qwen2_finetuned/`` (Requirement 5 AC 11-12).
 SELF_FINETUNED_PATH: str = "models/qwen2_finetuned/"

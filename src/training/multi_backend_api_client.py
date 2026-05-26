@@ -45,7 +45,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -78,6 +78,7 @@ class APIBackend(Enum):
     GROQ = "groq"
     OPENAI = "openai"
     CODEXHUB = "codexhub"
+    CKEY = "ckey"
 
 
 @dataclass(frozen=True)
@@ -203,24 +204,28 @@ def _default_http_post(
             "MultiBackendAPIClient for testing."
         )
     try:
+        # Use (connect_timeout, read_timeout) tuple so a hung TCP connection
+        # also gets killed, not just a slow response body.
+        # stream=True: read response body explicitly so we aren't blocked
+        # waiting for server to close the connection (some proxies keep it open).
         resp = _requests.post(  # type: ignore[union-attr]
-            url, headers=headers, json=json_body, timeout=timeout
+            url, headers=headers, json=json_body, timeout=(30.0, timeout),
+            stream=True,
         )
+        raw_text = resp.content.decode("utf-8", errors="replace")
     except _requests.exceptions.Timeout as exc:  # type: ignore[union-attr]
         raise _HttpTimeout(str(exc)) from exc
 
     body: Any = None
     try:
-        body = resp.json()
-    except Exception:  # noqa: BLE001 - response may not be JSON
+        body = json.loads(raw_text)
+    except Exception:  # noqa: BLE001
         # Fallback: parse Server-Sent Events (SSE) stream.
-        # Some proxies (e.g. CodexHub) always return SSE regardless of
-        # the `stream` field in the request body.
-        body = _parse_sse_to_json(resp.text or "")
+        body = _parse_sse_to_json(raw_text)
     return _HttpResponse(
         status_code=resp.status_code,
         json_body=body,
-        text=resp.text or "",
+        text=raw_text,
     )
 
 
@@ -293,15 +298,20 @@ class MultiBackendAPIClient:
     OPENAI_URL = "https://api.openai.com/v1/"
     CODEXHUB_DEFAULT_URL = "https://api.codexhub.click/v1"
     CODEXHUB_DEFAULT_MODEL = "cx/gpt-5.5"
+    CKEY_DEFAULT_URL = "https://ckey.vn/v1"
+    CKEY_DEFAULT_MODEL = "gpt-5.4-mini"
 
     PUTER_MODEL = "gpt-4o"
     GROQ_MODEL = "llama-3.3-70b-versatile"
     OPENAI_MODEL = "gpt-4o"
 
     PUTER_MAX_REQUESTS = 100
-    TIMEOUT_SECONDS = 90  # CodexHub SSE responses can take 60-80s on cold start
-    RETRY_WAIT_SECONDS = 10
-    MAX_RETRIES = 3
+    TIMEOUT_SECONDS = 180  # CodexHub SSE responses can take 60-80s on cold start; long prompts need more
+    RETRY_WAIT_SECONDS = 60  # Groq TPM limit resets each minute; wait full minute on 429
+    RETRY_WAIT_524 = 15  # CodexHub Cloudflare timeout — short wait then retry
+    INTER_REQUEST_DELAY_CODEXHUB = 3.0  # seconds between requests; adaptive (doubles on 429, max 30s)
+    INTER_REQUEST_DELAY_CKEY = 1.0  # seconds between requests for ckey.vn (lower latency proxy)
+    MAX_RETRIES = 5
 
     # Lỗi cấu hình môi trường (Requirement 7.2).
     ERR_NO_BACKEND = "Phải cấu hình ít nhất một trong bốn backend API"
@@ -346,21 +356,35 @@ class MultiBackendAPIClient:
         self._sleep_fn = sleep_fn if sleep_fn is not None else time.sleep
         self._http_post = http_post if http_post is not None else _default_http_post
 
-        # ---- Backend selection (priority CODEXHUB > OPENAI > GROQ > PUTER) -
+        # ---- Backend selection (priority CKEY > CODEXHUB > OPENAI > GROQ > PUTER) -
+        ckey_key = (os.environ.get("CKEY_API_KEY") or "").strip()
         codexhub_key = (os.environ.get("CODEXHUB_API_KEY") or "").strip()
         openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
         groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
         puter_token = (os.environ.get("PUTER_AUTH_TOKEN") or "").strip()
 
-        if codexhub_key:
+        if ckey_key:
+            self._backend = APIBackend.CKEY
+            self._api_key = ckey_key
+            self._base_url = (
+                os.environ.get("CKEY_BASE_URL") or self.CKEY_DEFAULT_URL
+            ).strip().rstrip("/")
+            self._model = (
+                os.environ.get("CKEY_MODEL") or self.CKEY_DEFAULT_MODEL
+            ).strip()
+        elif codexhub_key:
             self._backend = APIBackend.CODEXHUB
-            self._api_key = codexhub_key
             self._base_url = (
                 os.environ.get("CODEXHUB_BASE_URL") or self.CODEXHUB_DEFAULT_URL
             ).strip().rstrip("/")
             self._model = (
                 os.environ.get("CODEXHUB_MODEL") or self.CODEXHUB_DEFAULT_MODEL
             ).strip()
+            # Build round-robin key list (primary + optional secondary)
+            codexhub_key2 = (os.environ.get("CODEXHUB_API_KEY_2") or "").strip()
+            self._codexhub_keys: list[str] = [k for k in [codexhub_key, codexhub_key2] if k]
+            self._codexhub_key_idx: int = 0
+            self._api_key = self._codexhub_keys[0]
         elif openai_key:
             self._backend = APIBackend.OPENAI
             self._api_key = openai_key
@@ -379,6 +403,11 @@ class MultiBackendAPIClient:
         else:
             raise ValueError(self.ERR_NO_BACKEND)
 
+        # Non-CodexHub backends don't use round-robin key list.
+        if not hasattr(self, "_codexhub_keys"):
+            self._codexhub_keys = [self._api_key]
+            self._codexhub_key_idx = 0
+
         # ---- Mode-block: --mode full không tương thích với Puter --------
         if self._mode == "full" and self._backend is APIBackend.PUTER:
             raise ValueError(self.ERR_FULL_MODE_PUTER)
@@ -386,6 +415,12 @@ class MultiBackendAPIClient:
         # ---- Usage tracking --------------------------------------------
         self._usage = TokenUsageLog(backend=self._backend)
         self._request_count = 0  # increments on EVERY attempt (including 429)
+
+        # ---- Adaptive inter-request delay (doubles on 429) -------------
+        if self._backend is APIBackend.CKEY:
+            self._inter_request_delay = float(self.INTER_REQUEST_DELAY_CKEY)
+        else:
+            self._inter_request_delay = float(self.INTER_REQUEST_DELAY_CODEXHUB)
 
         logger.info(
             "MultiBackendAPIClient initialised: backend=%s, model=%s, mode=%s.",
@@ -465,17 +500,19 @@ class MultiBackendAPIClient:
                 )
 
         url = self._base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
         body: dict[str, Any] = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
+            "max_tokens": 200,
         }
 
         for attempt in range(1, self.MAX_RETRIES + 1):
+            # Rebuild headers each attempt so key rotation takes effect.
+            headers = {
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            }
             # Count this attempt (Puter limit applies to attempts, not just
             # successful responses; safest interpretation of "≤100 req/run").
             self._request_count += 1
@@ -511,16 +548,30 @@ class MultiBackendAPIClient:
 
             status = resp.status_code
             if status == 200:
+                if self._backend in (APIBackend.CODEXHUB, APIBackend.CKEY):
+                    self._sleep_fn(self._inter_request_delay)
                 return self._parse_success(resp)
 
             if status == 429:
-                # Rate-limited → wait and retry, unless this is the last attempt.
+                # Rate-limited → rotate to next key immediately (if multiple keys),
+                # then double inter-request delay (adaptive), then wait before retry.
+                old_idx = self._codexhub_key_idx
+                rotated = self._rotate_codexhub_key()
+                new_delay = min(self._inter_request_delay * 2, 30.0)
+                if new_delay != self._inter_request_delay:
+                    self._inter_request_delay = new_delay
+                key_info = (
+                    f"rotated key {old_idx}→{self._codexhub_key_idx}"
+                    if rotated else "single key"
+                )
                 logger.warning(
-                    "Rate-limited (HTTP 429) on attempt %d/%d (backend=%s); "
-                    "waiting %ds before retry.",
+                    "Rate-limited (HTTP 429) on attempt %d/%d (backend=%s, %s); "
+                    "inter-request delay → %.1fs; waiting %ds before retry.",
                     attempt,
                     self.MAX_RETRIES,
                     self._backend.value,
+                    key_info,
+                    self._inter_request_delay,
                     self.RETRY_WAIT_SECONDS,
                 )
                 if attempt < self.MAX_RETRIES:
@@ -529,6 +580,27 @@ class MultiBackendAPIClient:
                 # Exhausted retries.
                 logger.warning(
                     "Rate-limit retries exhausted (%d attempts) on backend=%s; "
+                    "returning empty content.",
+                    self.MAX_RETRIES,
+                    self._backend.value,
+                )
+                return self._empty_response()
+
+            if status == 524:
+                # Cloudflare gateway timeout — retry with short wait.
+                logger.warning(
+                    "API HTTP error 524 on backend=%s (attempt %d/%d); "
+                    "waiting %ds before retry.",
+                    self._backend.value,
+                    attempt,
+                    self.MAX_RETRIES,
+                    self.RETRY_WAIT_524,
+                )
+                if attempt < self.MAX_RETRIES:
+                    self._sleep_fn(float(self.RETRY_WAIT_524))
+                    continue
+                logger.warning(
+                    "524 retries exhausted (%d attempts) on backend=%s; "
                     "returning empty content.",
                     self.MAX_RETRIES,
                     self._backend.value,
@@ -550,6 +622,18 @@ class MultiBackendAPIClient:
         return self._empty_response()  # pragma: no cover
 
     # ----------------------------------------------------------- internals --
+
+    def _rotate_codexhub_key(self) -> bool:
+        """Rotate to the next CodexHub API key in round-robin order.
+
+        Returns True if rotation actually changed the key (i.e. more than one
+        key is configured), False when only one key exists.
+        """
+        if len(self._codexhub_keys) <= 1:
+            return False
+        self._codexhub_key_idx = (self._codexhub_key_idx + 1) % len(self._codexhub_keys)
+        self._api_key = self._codexhub_keys[self._codexhub_key_idx]
+        return True
 
     def _parse_success(self, resp: _HttpResponse) -> APIResponse:
         """Extract content + tokens từ một 200 OK response."""
